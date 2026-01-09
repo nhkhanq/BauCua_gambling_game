@@ -265,7 +265,7 @@ const App: React.FC = () => {
     }, SHAKE_DURATION);
   }, [bets, role]);
 
-  const currentTotalBet = (Object.values(bets) as number[]).reduce((a, b) => a + b, 0);
+  const currentTotalBet = (Object.values(bets) as number[]).reduce((a, b) => a + b, 0)
 
   return (
     <div className="min-h-screen bg-[url('https://www.transparenttextures.com/patterns/red-paper.png')] bg-fixed flex flex-col items-center pb-12 relative">
