@@ -7,6 +7,7 @@ import BettingBoard from './components/BettingBoard';
 import RoomControl from './components/RoomControl';
 import ResultOverlay from './components/ResultOverlay';
 import Leaderboard from './components/Leaderboard';
+import DebugPanel from './components/DebugPanel';
 
 // Utility for formatting money
 const formatMoney = (amount: number) => 
@@ -54,6 +55,10 @@ const App: React.FC = () => {
   const [roomId, setRoomId] = useState<string | null>(null);
   const [role, setRole] = useState<PlayerRole>('OFFLINE');
 
+  // --- Debug State ---
+  const [debugEnabled, setDebugEnabled] = useState<boolean>(false);
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
+
   // Refs
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
@@ -62,26 +67,52 @@ const App: React.FC = () => {
   // HOST ONLY: Map of all connected players to track their info
   const playersInfoRef = useRef<Map<string, PlayerInfo>>(new Map());
 
-  // --- Initialization ---
-  useEffect(() => {
-    localStorage.setItem('playerName', myName);
-    const params = new URLSearchParams(window.location.search);
-    const roomParam = params.get('room');
-    if (roomParam) joinRoomAsClient(roomParam);
+  // Helper: push debug log both to UI and console
+  const logDebug = useCallback(
+    (label: string, data?: unknown) => {
+      const ts = new Date().toISOString().split('T')[1]?.replace('Z', '') ?? '';
+      const line =
+        `[${ts}] ${label}` +
+        (data !== undefined
+          ? ` | ${(() => {
+              try {
+                return typeof data === 'string'
+                  ? data
+                  : JSON.stringify(data, null, 0);
+              } catch {
+                return String(data);
+              }
+            })()}`
+          : '');
 
-    return () => {
-      if (peerRef.current) peerRef.current.destroy();
-    };
-  }, []);
+      // Console log luôn, để xem được khi deploy
+      // eslint-disable-next-line no-console
+      console.log('[BauCua][DEBUG]', line);
+
+      setDebugLogs(prev => {
+        const next = [...prev, line];
+        // giữ lại tối đa 200 dòng
+        if (next.length > 200) next.splice(0, next.length - 200);
+        return next;
+      });
+    },
+    []
+  );
+
+  // --- Initialization ---
 
   // --- Sync my info to Host whenever balance changes ---
   useEffect(() => {
     if (role === 'CLIENT' && myId) {
       // Check if CLIENT ran out of money
       if (balance < MIN_BALANCE_TO_STAY) {
+        logDebug('CLIENT out of money, leaving room', { myId, balance });
         setMessage("Bạn đã hết tiền! Đang rời phòng...");
         setTimeout(() => {
-          if (peerRef.current) peerRef.current.destroy();
+          if (peerRef.current) {
+            logDebug('CLIENT destroy peer because out of money');
+            peerRef.current.destroy();
+          }
           setRole('OFFLINE');
           setRoomId(null);
           window.history.pushState({}, '', window.location.pathname);
@@ -94,6 +125,7 @@ const App: React.FC = () => {
         type: 'PLAYER_UPDATE',
         info: { id: myId, name: myName, balance, isHost: false }
       };
+      logDebug('CLIENT -> HOST PLAYER_UPDATE', msg);
       // Send to host
       if (connectionsRef.current[0]?.open) {
         connectionsRef.current[0].send(msg);
@@ -101,6 +133,7 @@ const App: React.FC = () => {
     } else if (role === 'HOST' && myId) {
       // Host updates their own info in the map directly
       playersInfoRef.current.set(myId, { id: myId, name: myName, balance, isHost: true });
+      logDebug('HOST self PLAYER_UPDATE', { myId, balance });
       updateAndBroadcastLeaderboard();
       
       // Host checks all clients' balances and kicks those who are broke
@@ -153,6 +186,11 @@ const App: React.FC = () => {
       const player = playersInfoRef.current.get(playerId);
       const conn = connectionsRef.current.find(c => c.peer === playerId);
       if (conn && player) {
+        logDebug('HOST kicking player for low balance', {
+          playerId,
+          name: player.name,
+          balance: player.balance,
+        });
         // Send kick message
         conn.send({ type: 'KICKED_NO_MONEY' } as NetworkMessage);
         // Broadcast player left
@@ -182,10 +220,11 @@ const App: React.FC = () => {
     playersInfoRef.current.clear();
     
     const fullId = APP_PREFIX + attemptId;
+    logDebug('initHostPeer called', { attemptId, fullId });
     const peer = new Peer(fullId);
     
     peer.on('open', () => {
-      console.log('HOST ID:', fullId);
+      logDebug('HOST Peer open', { fullId });
       setRole('HOST');
       setRoomId(attemptId);
       setMyId(fullId); // Host uses PeerID as ID
@@ -201,9 +240,12 @@ const App: React.FC = () => {
     });
 
     peer.on('connection', (conn) => {
-      console.log('Player attempting to connect:', conn.peer);
+      logDebug('HOST got incoming connection', { peer: conn.peer });
       
-      conn.on('data', (data) => handleHostReceivedMessage(data as NetworkMessage, conn.peer, conn));
+      conn.on('data', (data) => {
+        logDebug('HOST received data from peer', { from: conn.peer, raw: data });
+        handleHostReceivedMessage(data as NetworkMessage, conn.peer, conn);
+      });
       
       conn.on('open', () => {
          // Wait for JOIN_REQUEST from client before adding them
@@ -211,6 +253,7 @@ const App: React.FC = () => {
       });
       
       conn.on('close', () => {
+        logDebug('Connection closed (HOST side)', { peer: conn.peer });
         const player = playersInfoRef.current.get(conn.peer);
         if (player) {
           broadcast({ type: 'PLAYER_LEFT', playerName: player.name });
@@ -226,6 +269,7 @@ const App: React.FC = () => {
     });
 
     peer.on('error', (err) => {
+      logDebug('HOST Peer error', err);
       if (err.type === 'unavailable-id') {
         initHostPeer(Math.random().toString(36).substring(2, 8).toUpperCase());
       } else {
@@ -234,7 +278,7 @@ const App: React.FC = () => {
     });
   };
 
-  const joinRoomAsClient = (targetRoomId: string) => {
+  const joinRoomAsClient = useCallback((targetRoomId: string) => {
     // Check balance before attempting to join
     if (balance < MIN_BALANCE_TO_JOIN) {
       setMessage(`Cần tối thiểu ${formatMoney(MIN_BALANCE_TO_JOIN)} để vào phòng!`);
@@ -242,39 +286,50 @@ const App: React.FC = () => {
       return;
     }
 
+    logDebug('joinRoomAsClient called', { targetRoomId, balance });
+
     if (peerRef.current) peerRef.current.destroy();
     connectionsRef.current = [];
 
     const peer = new Peer();
 
     peer.on('open', (id) => {
+      logDebug('CLIENT Peer open', { id, targetRoomId });
       setRole('CLIENT');
       setRoomId(targetRoomId);
       setMyId(id);
       peerRef.current = peer;
       setMessage("Đang kết nối đến phòng...");
 
-      const conn = peer.connect(APP_PREFIX + targetRoomId);
+      const peerTarget = APP_PREFIX + targetRoomId;
+      logDebug('CLIENT connecting to HOST', { peerTarget });
+      const conn = peer.connect(peerTarget);
       connectionsRef.current = [conn];
 
       conn.on('open', () => {
         setMessage("Đang xin vào phòng...");
-        // Send JOIN_REQUEST
-        conn.send({ 
+        const joinMsg: NetworkMessage = { 
           type: 'JOIN_REQUEST', 
           playerInfo: { id, name: myName, balance, isHost: false } 
-        } as NetworkMessage);
+        };
+        logDebug('CLIENT -> HOST JOIN_REQUEST', joinMsg);
+        conn.send(joinMsg);
       });
 
-      conn.on('data', (data) => handleClientReceivedMessage(data as NetworkMessage));
+      conn.on('data', (data) => {
+        logDebug('CLIENT received data from HOST', data);
+        handleClientReceivedMessage(data as NetworkMessage);
+      });
       
       conn.on('close', () => {
+        logDebug('CLIENT connection closed', { targetRoomId });
         setMessage("Mất kết nối với chủ phòng.");
         setRole('OFFLINE');
         setRoomId(null);
       });
 
       conn.on('error', () => {
+        logDebug('CLIENT connection error', { targetRoomId });
         setMessage("Không tìm thấy phòng này.");
         setRole('OFFLINE');
         setRoomId(null);
@@ -282,24 +337,47 @@ const App: React.FC = () => {
     });
 
     peer.on('error', (err) => {
-      console.error('Peer error:', err);
+      logDebug('CLIENT Peer error', err);
       setMessage("Lỗi kết nối. Vui lòng thử lại.");
       setRole('OFFLINE');
       setRoomId(null);
     });
-  };
+  }, [balance, logDebug, myName]);
+
+  // --- Initialization ---
+  useEffect(() => {
+    localStorage.setItem('playerName', myName);
+    const params = new URLSearchParams(window.location.search);
+    const roomParam = params.get('room');
+    if (roomParam) {
+      logDebug('Init: found room param in URL', { roomParam });
+      joinRoomAsClient(roomParam);
+    } else {
+      logDebug('Init: no room param, OFFLINE mode');
+    }
+
+    return () => {
+      if (peerRef.current) {
+        logDebug('Cleanup: destroying peer on unmount');
+        peerRef.current.destroy();
+      }
+    };
+  }, [joinRoomAsClient, logDebug, myName]);
 
   // --- Message Handlers ---
 
   const handleHostReceivedMessage = (msg: NetworkMessage, peerId: string, conn?: DataConnection) => {
     if (msg.type === 'JOIN_REQUEST') {
+      logDebug('HOST received JOIN_REQUEST', { from: peerId, info: msg.playerInfo });
       // Check if player has enough balance to join
       if (msg.playerInfo.balance < MIN_BALANCE_TO_JOIN) {
         if (conn) {
-          conn.send({ 
+          const rejectMsg: NetworkMessage = { 
             type: 'JOIN_REJECTED', 
             reason: `Cần tối thiểu ${formatMoney(MIN_BALANCE_TO_JOIN)} để vào phòng.` 
-          } as NetworkMessage);
+          };
+          logDebug('HOST -> CLIENT JOIN_REJECTED', { to: peerId, reason: rejectMsg.reason });
+          conn.send(rejectMsg);
           setTimeout(() => conn.close(), 500);
         }
         return;
@@ -312,13 +390,18 @@ const App: React.FC = () => {
 
       // Send acceptance with current room state
       if (conn) {
-        conn.send({
-          type: 'JOIN_ACCEPTED',
+        const acceptMsg = {
+          type: 'JOIN_ACCEPTED' as const,
           roomState: {
             globalBets: calculateGlobalBetsFromRef(),
             players: Array.from(playersInfoRef.current.values())
           }
-        } as NetworkMessage);
+        };
+        logDebug('HOST -> CLIENT JOIN_ACCEPTED', {
+          to: peerId,
+          players: acceptMsg.roomState.players.length
+        });
+        conn.send(acceptMsg as NetworkMessage);
       }
 
       // Broadcast to all other players that someone joined
@@ -329,6 +412,7 @@ const App: React.FC = () => {
       updateAndBroadcastLeaderboard();
     }
     else if (msg.type === 'PLACE_BET') {
+      logDebug('HOST received PLACE_BET', { from: peerId, key: msg.key, amount: msg.amount });
       const playerBets = allPlayersBetsRef.current.get(peerId) || getEmptyBets();
       playerBets[msg.key] += msg.amount;
       allPlayersBetsRef.current.set(peerId, playerBets);
@@ -342,6 +426,7 @@ const App: React.FC = () => {
       // Update player info registry
       const existingPlayer = playersInfoRef.current.get(peerId);
       if (existingPlayer) {
+        logDebug('HOST received PLAYER_UPDATE', { from: peerId, info: msg.info });
         playersInfoRef.current.set(peerId, msg.info);
         updateAndBroadcastLeaderboard();
         
@@ -353,7 +438,8 @@ const App: React.FC = () => {
     }
   };
 
-  const handleClientReceivedMessage = (msg: NetworkMessage) => {
+  const handleClientReceivedMessage = (msg: any) => {
+    logDebug('CLIENT handle message', { type: msg.type, raw: msg });
     if (msg.type === 'JOIN_ACCEPTED') {
       setGlobalBets(msg.roomState.globalBets);
       setLeaderboard(msg.roomState.players);
@@ -369,6 +455,7 @@ const App: React.FC = () => {
       }, 3000);
     }
     else if (msg.type === 'KICKED_NO_MONEY') {
+      logDebug('CLIENT received KICKED_NO_MONEY');
       setMessage("Bạn đã hết tiền! Đang rời phòng...");
       setTimeout(() => {
         if (peerRef.current) peerRef.current.destroy();
@@ -511,6 +598,7 @@ const App: React.FC = () => {
 
   const handleCreateRoomAction = () => {
     setMessage("Đang khởi tạo...");
+    logDebug('UI: create room clicked');
     initHostPeer(Math.random().toString(36).substring(2, 8).toUpperCase());
   };
   
@@ -621,6 +709,17 @@ const App: React.FC = () => {
       <footer className="w-full text-center py-4 text-red-300 text-xs">
          © 2025 Game Bầu Cua Online
       </footer>
+
+      {/* Debug Panel hiển thị cả trên bản deploy (không cần DevTools) */}
+      <DebugPanel
+        enabled={debugEnabled}
+        onToggle={() => setDebugEnabled(prev => !prev)}
+        role={role}
+        roomId={roomId}
+        myId={myId}
+        connectionsCount={connectionsRef.current.length}
+        logs={debugLogs}
+      />
     </div>
   );
 };
