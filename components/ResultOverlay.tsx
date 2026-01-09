@@ -17,7 +17,7 @@ const ResultOverlay: React.FC<ResultOverlayProps> = ({ winAmount, totalBet, resu
     setTimeout(() => setVisible(true), 50);
   }, []);
 
-  const isWin = winAmount > 0;
+  // Removed unused isWin variable
   const isLoss = totalBet > 0 && winAmount <= 0; // Bet but lost (or win = 0 which is loss of bet usually, logic depends on game rule, here winAmount includes refund)
   // In App.tsx logic: calculateWinnings returns total return (refund + profit). 
   // Profit = winAmount - totalBet.
