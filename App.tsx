@@ -64,6 +64,7 @@ const App: React.FC = () => {
 
   const initHostPeer = (attemptId: string) => {
     if (peerRef.current) peerRef.current.destroy();
+    connectionsRef.current = []; // Clear old connections
 
     const fullId = APP_PREFIX + attemptId;
     const peer = new Peer(fullId);
@@ -124,6 +125,7 @@ const App: React.FC = () => {
 
   const joinRoomAsClient = (targetRoomId: string) => {
     if (peerRef.current) peerRef.current.destroy();
+    connectionsRef.current = []; // Clear old connections
 
     const peer = new Peer();
 
@@ -135,6 +137,8 @@ const App: React.FC = () => {
       setMessage("Đang kết nối tới chủ phòng...");
 
       const conn = peer.connect(APP_PREFIX + targetRoomId);
+      // Store connection reference for Client to send messages easily
+      connectionsRef.current = [conn];
 
       conn.on('open', () => {
         setMessage("Đã vào phòng! Chờ chủ phòng lắc.");
@@ -263,7 +267,8 @@ const App: React.FC = () => {
     // 2. Sync with Host
     if (role === 'CLIENT') {
       // Send only the increment action
-      const conn = peerRef.current?.connections[Object.keys(peerRef.current.connections)[0]]?.[0];
+      // We stored the connection in connectionsRef inside joinRoomAsClient
+      const conn = connectionsRef.current[0];
       if (conn && conn.open) {
         conn.send({ type: 'PLACE_BET', key, amount: BET_INCREMENT });
       }
@@ -290,7 +295,7 @@ const App: React.FC = () => {
 
     // 2. Sync with Host
     if (role === 'CLIENT') {
-      const conn = peerRef.current?.connections[Object.keys(peerRef.current.connections)[0]]?.[0];
+      const conn = connectionsRef.current[0];
       if (conn && conn.open) {
         conn.send({ type: 'RESET_BETS' });
       }
@@ -323,7 +328,8 @@ const App: React.FC = () => {
       calculateWinnings(newResults);
       
       // Reset Global Bets Map for next round
-      allPlayersBetsRef.current.forEach((value, key) => {
+      // Fixed TS unused variable error by renaming 'value' to '_'
+      allPlayersBetsRef.current.forEach((_, key) => {
         allPlayersBetsRef.current.set(key, getEmptyBets());
       });
       updateAndBroadcastGlobalBets();
@@ -338,7 +344,6 @@ const App: React.FC = () => {
   };
   
   const handleCopyLink = () => {
-     // ... same as before
     if (roomId) {
       try {
         const url = new URL(window.location.href);
