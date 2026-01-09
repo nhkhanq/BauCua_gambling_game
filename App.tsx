@@ -21,7 +21,7 @@ const App: React.FC = () => {
   });
   const [isShaking, setIsShaking] = useState<boolean>(false);
   const [diceResult, setDiceResult] = useState<GameItemKey[]>(['NAI', 'BAU', 'GA']);
-  const [lastWin, setLastWin] = useState<number>(0);
+  // Removed unused lastWin state to fix build error
   const [message, setMessage] = useState<string>("Chúc Mừng Năm Mới! Hãy đặt cược để lấy hên!");
   
   // --- Network State ---
@@ -176,7 +176,6 @@ const App: React.FC = () => {
     if (msg.type === 'SHAKE_START') {
       setIsShaking(true);
       setMessage("Chủ phòng đang lắc...");
-      setLastWin(0);
     } else if (msg.type === 'SHAKE_RESULT') {
       setIsShaking(false);
       setDiceResult(msg.results);
@@ -210,7 +209,6 @@ const App: React.FC = () => {
     });
 
     setBalance(prev => prev + totalWinnings);
-    setLastWin(totalWinnings);
     setBets({ NAI: 0, BAU: 0, GA: 0, CA: 0, CUA: 0, TOM: 0 });
 
     if (hasBet) {
@@ -250,7 +248,6 @@ const App: React.FC = () => {
     
     setIsShaking(true);
     setMessage("Đang lắc...");
-    setLastWin(0);
 
     broadcast({ type: 'SHAKE_START' });
 
