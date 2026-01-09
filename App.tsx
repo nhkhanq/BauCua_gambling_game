@@ -13,15 +13,21 @@ const formatMoney = (amount: number) =>
 // PeerJS ID Prefix to avoid public ID collisions
 const APP_PREFIX = 'baucuatet2025-';
 
+// Helper to get empty bets object
+const getEmptyBets = (): Record<GameItemKey, number> => ({
+  NAI: 0, BAU: 0, GA: 0, CA: 0, CUA: 0, TOM: 0
+});
+
 const App: React.FC = () => {
   // --- Game State ---
   const [balance, setBalance] = useState<number>(INITIAL_BALANCE);
-  const [bets, setBets] = useState<Record<GameItemKey, number>>({
-    NAI: 0, BAU: 0, GA: 0, CA: 0, CUA: 0, TOM: 0
-  });
+  // My local bets (for wallet calculation)
+  const [bets, setBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
+  // Global bets (aggregated from all players - for display)
+  const [globalBets, setGlobalBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
+  
   const [isShaking, setIsShaking] = useState<boolean>(false);
   const [diceResult, setDiceResult] = useState<GameItemKey[]>(['NAI', 'BAU', 'GA']);
-  // Removed unused lastWin state to fix build error
   const [message, setMessage] = useState<string>("Chúc Mừng Năm Mới! Hãy đặt cược để lấy hên!");
   
   // --- Network State ---
@@ -32,6 +38,10 @@ const App: React.FC = () => {
   // Refs for managing Peer lifecycle without re-renders
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
+  
+  // HOST ONLY: Track bets from all players to aggregate totals
+  // Map<PeerID, BetsObject>
+  const allPlayersBetsRef = useRef<Map<string, Record<GameItemKey, number>>>(new Map());
 
   // --- Initialization Effect ---
   useEffect(() => {
@@ -53,7 +63,6 @@ const App: React.FC = () => {
   // --- Network Functions ---
 
   const initHostPeer = (attemptId: string) => {
-    // If a peer already exists, destroy it first
     if (peerRef.current) peerRef.current.destroy();
 
     const fullId = APP_PREFIX + attemptId;
@@ -65,13 +74,14 @@ const App: React.FC = () => {
       setRoomId(attemptId);
       peerRef.current = peer;
       setMessage("Phòng đã tạo! Hãy mời bạn bè.");
+      // Initialize Host's own bets in the map
+      allPlayersBetsRef.current.set('HOST', getEmptyBets());
 
-      // Safe URL update: Use relative path and try-catch to avoid SecurityError in sandboxes/blobs
       try {
         const newPath = `?room=${attemptId}`;
         window.history.pushState({}, '', newPath);
       } catch (e) {
-        console.warn('URL update skipped (environment restriction):', e);
+        console.warn('URL update skipped:', e);
       }
     });
 
@@ -79,25 +89,35 @@ const App: React.FC = () => {
       console.log('Client connected:', conn.peer);
       connectionsRef.current.push(conn);
       setPlayerCount(prev => prev + 1);
+      
+      // Initialize new player bets
+      allPlayersBetsRef.current.set(conn.peer, getEmptyBets());
 
+      conn.on('data', (data) => {
+        handleHostReceivedMessage(data as NetworkMessage, conn.peer);
+      });
+      
       conn.on('open', () => {
-        // Optional: Send current game state to new player
+         // Send current global bets to new player immediately
+         conn.send({ type: 'UPDATE_GLOBAL_BETS', bets: globalBets });
       });
       
       conn.on('close', () => {
         connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
         setPlayerCount(prev => Math.max(1, prev - 1));
+        // Remove player bets and update global
+        allPlayersBetsRef.current.delete(conn.peer);
+        updateAndBroadcastGlobalBets();
       });
     });
 
     peer.on('error', (err) => {
       console.error('Peer Error:', err);
       if (err.type === 'unavailable-id') {
-        // Retry with a new ID if taken
         const newId = Math.random().toString(36).substring(2, 8).toUpperCase();
         initHostPeer(newId);
       } else {
-        setMessage("Lỗi kết nối mạng. Vui lòng thử lại.");
+        setMessage("Lỗi kết nối mạng.");
       }
     });
   };
@@ -105,7 +125,6 @@ const App: React.FC = () => {
   const joinRoomAsClient = (targetRoomId: string) => {
     if (peerRef.current) peerRef.current.destroy();
 
-    // Client needs no specific ID
     const peer = new Peer();
 
     peer.on('open', (myId) => {
@@ -122,7 +141,7 @@ const App: React.FC = () => {
       });
 
       conn.on('data', (data: unknown) => {
-        handleNetworkMessage(data as NetworkMessage);
+        handleClientReceivedMessage(data as NetworkMessage);
       });
 
       conn.on('close', () => {
@@ -135,32 +154,50 @@ const App: React.FC = () => {
          setMessage("Không thể kết nối tới phòng này.");
       });
     });
+  };
 
-    peer.on('error', (err) => {
-      console.error('Client Peer Error:', err);
-      setMessage("Lỗi mạng client.");
+  // --- HOST Logic: Handle messages from clients ---
+  const handleHostReceivedMessage = (msg: NetworkMessage, peerId: string) => {
+    if (msg.type === 'PLACE_BET') {
+      const playerBets = allPlayersBetsRef.current.get(peerId) || getEmptyBets();
+      playerBets[msg.key] += msg.amount;
+      allPlayersBetsRef.current.set(peerId, playerBets);
+      updateAndBroadcastGlobalBets();
+    } 
+    else if (msg.type === 'RESET_BETS') {
+      allPlayersBetsRef.current.set(peerId, getEmptyBets());
+      updateAndBroadcastGlobalBets();
+    }
+  };
+
+  // --- HOST Logic: Calculate totals and broadcast ---
+  const updateAndBroadcastGlobalBets = () => {
+    const newGlobalBets = getEmptyBets();
+    
+    allPlayersBetsRef.current.forEach((playerBets) => {
+      (Object.keys(playerBets) as GameItemKey[]).forEach((key) => {
+        newGlobalBets[key] += playerBets[key];
+      });
     });
+
+    setGlobalBets(newGlobalBets);
+    broadcast({ type: 'UPDATE_GLOBAL_BETS', bets: newGlobalBets });
   };
 
-  const handleCreateRoomAction = () => {
-    setMessage("Đang tạo phòng...");
-    const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
-    initHostPeer(newRoomId);
-  };
+  // --- Message Handlers ---
 
-  const handleCopyLink = () => {
-    if (roomId) {
-      // Robust link generation
-      try {
-        const url = new URL(window.location.href);
-        url.searchParams.set('room', roomId);
-        navigator.clipboard.writeText(url.toString());
-        alert('Đã sao chép link!');
-      } catch (e) {
-        // Fallback for simple copy
-        navigator.clipboard.writeText(window.location.href);
-        alert('Đã sao chép link!');
-      }
+  const handleClientReceivedMessage = (msg: NetworkMessage) => {
+    if (msg.type === 'SHAKE_START') {
+      setIsShaking(true);
+      setMessage("Chủ phòng đang lắc...");
+    } else if (msg.type === 'SHAKE_RESULT') {
+      setIsShaking(false);
+      setDiceResult(msg.results);
+      calculateWinnings(msg.results);
+      // Host resets global bets, so client should eventually receive 'UPDATE_GLOBAL_BETS' with 0s
+      // But we also reset locally in calculateWinnings
+    } else if (msg.type === 'UPDATE_GLOBAL_BETS') {
+      setGlobalBets(msg.bets);
     }
   };
 
@@ -170,17 +207,6 @@ const App: React.FC = () => {
         conn.send(msg);
       }
     });
-  };
-
-  const handleNetworkMessage = (msg: NetworkMessage) => {
-    if (msg.type === 'SHAKE_START') {
-      setIsShaking(true);
-      setMessage("Chủ phòng đang lắc...");
-    } else if (msg.type === 'SHAKE_RESULT') {
-      setIsShaking(false);
-      setDiceResult(msg.results);
-      calculateWinnings(msg.results);
-    }
   };
 
   // --- Game Logic ---
@@ -209,8 +235,9 @@ const App: React.FC = () => {
     });
 
     setBalance(prev => prev + totalWinnings);
-    setBets({ NAI: 0, BAU: 0, GA: 0, CA: 0, CUA: 0, TOM: 0 });
-
+    // Reset local bets
+    setBets(getEmptyBets());
+    
     if (hasBet) {
       if (totalWinnings > 0) {
          setMessage(`Thắng ${formatMoney(totalWinnings)}!`);
@@ -228,19 +255,49 @@ const App: React.FC = () => {
       setMessage("Không đủ tiền!");
       return;
     }
+    
+    // 1. Update Local State
     setBalance(prev => prev - BET_INCREMENT);
     setBets((prev) => ({ ...prev, [key]: (prev[key] || 0) + BET_INCREMENT }));
+
+    // 2. Sync with Host
+    if (role === 'CLIENT') {
+      // Send only the increment action
+      const conn = peerRef.current?.connections[Object.keys(peerRef.current.connections)[0]]?.[0];
+      if (conn && conn.open) {
+        conn.send({ type: 'PLACE_BET', key, amount: BET_INCREMENT });
+      }
+    } else if (role === 'HOST') {
+      // Host updates their own entry in the map
+      const hostBets = allPlayersBetsRef.current.get('HOST') || getEmptyBets();
+      hostBets[key] += BET_INCREMENT;
+      allPlayersBetsRef.current.set('HOST', hostBets);
+      updateAndBroadcastGlobalBets();
+    }
   };
 
   const handleResetBets = () => {
     if (isShaking) return;
+    
+    // 1. Refund Local
     let totalBets = 0;
     (Object.keys(bets) as GameItemKey[]).forEach(key => {
       totalBets += bets[key];
     });
     setBalance(prev => prev + totalBets);
-    setBets({ NAI: 0, BAU: 0, GA: 0, CA: 0, CUA: 0, TOM: 0 });
+    setBets(getEmptyBets());
     setMessage("Đã hoàn tiền.");
+
+    // 2. Sync with Host
+    if (role === 'CLIENT') {
+      const conn = peerRef.current?.connections[Object.keys(peerRef.current.connections)[0]]?.[0];
+      if (conn && conn.open) {
+        conn.send({ type: 'RESET_BETS' });
+      }
+    } else if (role === 'HOST') {
+      allPlayersBetsRef.current.set('HOST', getEmptyBets());
+      updateAndBroadcastGlobalBets();
+    }
   };
 
   const handleHostShake = useCallback(() => {
@@ -261,11 +318,41 @@ const App: React.FC = () => {
       setDiceResult(newResults);
       setIsShaking(false);
       broadcast({ type: 'SHAKE_RESULT', results: newResults });
+      
+      // Calculate Host winnings locally
       calculateWinnings(newResults);
+      
+      // Reset Global Bets Map for next round
+      allPlayersBetsRef.current.forEach((value, key) => {
+        allPlayersBetsRef.current.set(key, getEmptyBets());
+      });
+      updateAndBroadcastGlobalBets();
+
     }, SHAKE_DURATION);
   }, [bets, role]);
 
-  const currentTotalBet = (Object.values(bets) as number[]).reduce((a, b) => a + b, 0)
+  const handleCreateRoomAction = () => {
+    setMessage("Đang tạo phòng...");
+    const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+    initHostPeer(newRoomId);
+  };
+  
+  const handleCopyLink = () => {
+     // ... same as before
+    if (roomId) {
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.set('room', roomId);
+        navigator.clipboard.writeText(url.toString());
+        alert('Đã sao chép link!');
+      } catch (e) {
+        navigator.clipboard.writeText(window.location.href);
+        alert('Đã sao chép link!');
+      }
+    }
+  };
+
+  const currentTotalBet = (Object.values(bets) as number[]).reduce((a, b) => a + b, 0);
 
   return (
     <div className="min-h-screen bg-[url('https://www.transparenttextures.com/patterns/red-paper.png')] bg-fixed flex flex-col items-center pb-12 relative">
@@ -309,9 +396,14 @@ const App: React.FC = () => {
           {message}
         </div>
 
-        {/* Betting Board */}
+        {/* Betting Board - Pass globalBets here */}
         <section className="w-full">
-           <BettingBoard bets={bets} onPlaceBet={handlePlaceBet} disabled={isShaking} />
+           <BettingBoard 
+             bets={bets} 
+             globalBets={globalBets} 
+             onPlaceBet={handlePlaceBet} 
+             disabled={isShaking} 
+            />
         </section>
 
         {/* Controls */}

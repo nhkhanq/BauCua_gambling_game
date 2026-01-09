@@ -23,4 +23,7 @@ export type PlayerRole = 'HOST' | 'CLIENT' | 'OFFLINE';
 export type NetworkMessage = 
   | { type: 'SHAKE_START' }
   | { type: 'SHAKE_RESULT'; results: GameItemKey[] }
-  | { type: 'PLAYER_JOINED'; count: number };
+  | { type: 'PLAYER_JOINED'; count: number }
+  | { type: 'PLACE_BET'; key: GameItemKey; amount: number } // Client sends to Host
+  | { type: 'RESET_BETS' } // Client requests Host to clear their bets
+  | { type: 'UPDATE_GLOBAL_BETS'; bets: Record<GameItemKey, number> }; // Host broadcasts total bets

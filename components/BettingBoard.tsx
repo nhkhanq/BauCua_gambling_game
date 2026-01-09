@@ -4,20 +4,29 @@ import { GAME_ITEMS } from '../constants';
 
 interface BettingBoardProps {
   bets: Record<GameItemKey, number>;
+  globalBets: Record<GameItemKey, number>;
   onPlaceBet: (key: GameItemKey) => void;
   disabled: boolean;
 }
 
-const BettingBoard: React.FC<BettingBoardProps> = ({ bets, onPlaceBet, disabled }) => {
+const BettingBoard: React.FC<BettingBoardProps> = ({ bets, globalBets, onPlaceBet, disabled }) => {
   
   const formatCurrency = (amount: number) => {
-    return new Intl.NumberFormat('vi-VN', { style: 'currency', currency: 'VND' }).format(amount);
+    // Shorten format for global bets if needed, e.g. 100k
+    if (amount >= 1000000) return (amount / 1000000).toFixed(1) + 'M';
+    if (amount >= 1000) return (amount / 1000).toFixed(0) + 'k';
+    return amount.toString();
   };
+
+  const formatMyBet = (amount: number) => {
+     return new Intl.NumberFormat('vi-VN').format(amount);
+  }
 
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 gap-3 md:gap-4 w-full max-w-2xl mx-auto p-2">
       {GAME_ITEMS.map((item: GameItem) => {
         const currentBet = bets[item.key] || 0;
+        const totalGlobalBet = globalBets[item.key] || 0;
         
         return (
           <button
@@ -35,14 +44,22 @@ const BettingBoard: React.FC<BettingBoardProps> = ({ bets, onPlaceBet, disabled 
                {/* Pattern background */}
                <div className={`absolute inset-0 opacity-10 ${item.color}`}></div>
                <span className="text-6xl md:text-7xl transform group-hover:scale-110 transition-transform">{item.emoji}</span>
+               
+               {/* Total Global Bets Indicator (Top Left of image) */}
+               {totalGlobalBet > 0 && (
+                 <div className="absolute top-1 left-1 bg-black/60 backdrop-blur-sm text-white text-[10px] md:text-xs px-2 py-0.5 rounded-full flex items-center gap-1">
+                   <span>👥</span>
+                   <span>{formatCurrency(totalGlobalBet)}</span>
+                 </div>
+               )}
             </div>
 
             <span className="font-display text-tet-red text-xl uppercase tracking-wide">{item.name}</span>
             
-            {/* Bet Chip */}
+            {/* My Bet Chip (Top Right) */}
             {currentBet > 0 && (
-              <div className="absolute -top-2 -right-2 bg-tet-gold text-red-900 font-bold px-3 py-1 rounded-full shadow-lg border-2 border-white animate-pop text-xs md:text-sm">
-                {formatCurrency(currentBet)}
+              <div className="absolute -top-2 -right-2 bg-tet-gold text-red-900 font-bold px-3 py-1 rounded-full shadow-lg border-2 border-white animate-pop text-xs md:text-sm z-10">
+                {formatMyBet(currentBet)}
               </div>
             )}
             
