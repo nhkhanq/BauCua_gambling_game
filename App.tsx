@@ -5,6 +5,7 @@ import { GAME_ITEMS, BET_INCREMENT, INITIAL_BALANCE, SHAKE_DURATION } from './co
 import DiceContainer from './components/DiceContainer';
 import BettingBoard from './components/BettingBoard';
 import RoomControl from './components/RoomControl';
+import ResultOverlay from './components/ResultOverlay';
 
 // Utility for formatting money
 const formatMoney = (amount: number) => 
@@ -21,15 +22,21 @@ const getEmptyBets = (): Record<GameItemKey, number> => ({
 const App: React.FC = () => {
   // --- Game State ---
   const [balance, setBalance] = useState<number>(INITIAL_BALANCE);
-  // My local bets (for wallet calculation)
   const [bets, setBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
-  // Global bets (aggregated from all players - for display)
   const [globalBets, setGlobalBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
   
   const [isShaking, setIsShaking] = useState<boolean>(false);
   const [diceResult, setDiceResult] = useState<GameItemKey[]>(['NAI', 'BAU', 'GA']);
   const [message, setMessage] = useState<string>("Chúc Mừng Năm Mới! Hãy đặt cược để lấy hên!");
   
+  // New State for Result Overlay
+  const [resultState, setResultState] = useState<{
+    show: boolean;
+    winAmount: number; // Total returned (profit + capital)
+    totalBet: number;
+    results: GameItemKey[];
+  } | null>(null);
+
   // --- Network State ---
   const [roomId, setRoomId] = useState<string | null>(null);
   const [role, setRole] = useState<PlayerRole>('OFFLINE');
@@ -40,7 +47,6 @@ const App: React.FC = () => {
   const connectionsRef = useRef<DataConnection[]>([]);
   
   // HOST ONLY: Track bets from all players to aggregate totals
-  // Map<PeerID, BetsObject>
   const allPlayersBetsRef = useRef<Map<string, Record<GameItemKey, number>>>(new Map());
 
   // --- Initialization Effect ---
@@ -64,7 +70,7 @@ const App: React.FC = () => {
 
   const initHostPeer = (attemptId: string) => {
     if (peerRef.current) peerRef.current.destroy();
-    connectionsRef.current = []; // Clear old connections
+    connectionsRef.current = [];
 
     const fullId = APP_PREFIX + attemptId;
     const peer = new Peer(fullId);
@@ -75,7 +81,6 @@ const App: React.FC = () => {
       setRoomId(attemptId);
       peerRef.current = peer;
       setMessage("Phòng đã tạo! Hãy mời bạn bè.");
-      // Initialize Host's own bets in the map
       allPlayersBetsRef.current.set('HOST', getEmptyBets());
 
       try {
@@ -91,7 +96,6 @@ const App: React.FC = () => {
       connectionsRef.current.push(conn);
       setPlayerCount(prev => prev + 1);
       
-      // Initialize new player bets
       allPlayersBetsRef.current.set(conn.peer, getEmptyBets());
 
       conn.on('data', (data) => {
@@ -99,14 +103,12 @@ const App: React.FC = () => {
       });
       
       conn.on('open', () => {
-         // Send current global bets to new player immediately
          conn.send({ type: 'UPDATE_GLOBAL_BETS', bets: globalBets });
       });
       
       conn.on('close', () => {
         connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
         setPlayerCount(prev => Math.max(1, prev - 1));
-        // Remove player bets and update global
         allPlayersBetsRef.current.delete(conn.peer);
         updateAndBroadcastGlobalBets();
       });
@@ -125,7 +127,7 @@ const App: React.FC = () => {
 
   const joinRoomAsClient = (targetRoomId: string) => {
     if (peerRef.current) peerRef.current.destroy();
-    connectionsRef.current = []; // Clear old connections
+    connectionsRef.current = [];
 
     const peer = new Peer();
 
@@ -137,7 +139,6 @@ const App: React.FC = () => {
       setMessage("Đang kết nối tới chủ phòng...");
 
       const conn = peer.connect(APP_PREFIX + targetRoomId);
-      // Store connection reference for Client to send messages easily
       connectionsRef.current = [conn];
 
       conn.on('open', () => {
@@ -160,7 +161,6 @@ const App: React.FC = () => {
     });
   };
 
-  // --- HOST Logic: Handle messages from clients ---
   const handleHostReceivedMessage = (msg: NetworkMessage, peerId: string) => {
     if (msg.type === 'PLACE_BET') {
       const playerBets = allPlayersBetsRef.current.get(peerId) || getEmptyBets();
@@ -174,32 +174,26 @@ const App: React.FC = () => {
     }
   };
 
-  // --- HOST Logic: Calculate totals and broadcast ---
   const updateAndBroadcastGlobalBets = () => {
     const newGlobalBets = getEmptyBets();
-    
     allPlayersBetsRef.current.forEach((playerBets) => {
       (Object.keys(playerBets) as GameItemKey[]).forEach((key) => {
         newGlobalBets[key] += playerBets[key];
       });
     });
-
     setGlobalBets(newGlobalBets);
     broadcast({ type: 'UPDATE_GLOBAL_BETS', bets: newGlobalBets });
   };
 
-  // --- Message Handlers ---
-
   const handleClientReceivedMessage = (msg: NetworkMessage) => {
     if (msg.type === 'SHAKE_START') {
       setIsShaking(true);
+      setResultState(null); // Clear previous result overlay
       setMessage("Chủ phòng đang lắc...");
     } else if (msg.type === 'SHAKE_RESULT') {
       setIsShaking(false);
       setDiceResult(msg.results);
       calculateWinnings(msg.results);
-      // Host resets global bets, so client should eventually receive 'UPDATE_GLOBAL_BETS' with 0s
-      // But we also reset locally in calculateWinnings
     } else if (msg.type === 'UPDATE_GLOBAL_BETS') {
       setGlobalBets(msg.bets);
     }
@@ -216,11 +210,10 @@ const App: React.FC = () => {
   // --- Game Logic ---
 
   const calculateWinnings = (results: GameItemKey[]) => {
-    let totalWinnings = 0;
+    let totalReturn = 0; // Includes initial bet + profit
     const counts: Record<string, number> = {};
     results.forEach(x => { counts[x] = (counts[x] || 0) + 1; });
 
-    let hasBet = false;
     let currentTotalBet = 0;
     
     (Object.keys(bets) as GameItemKey[]).forEach(key => {
@@ -228,25 +221,33 @@ const App: React.FC = () => {
       const appearances = counts[key] || 0;
       currentTotalBet += betAmount;
 
-      if (betAmount > 0) {
-        hasBet = true;
-        if (appearances > 0) {
+      if (betAmount > 0 && appearances > 0) {
            const profit = betAmount * appearances;
            const refund = betAmount;
-           totalWinnings += (refund + profit);
-        }
+           totalReturn += (refund + profit);
       }
     });
 
-    setBalance(prev => prev + totalWinnings);
+    setBalance(prev => prev + totalReturn);
+
+    // Show Overlay Result
+    setResultState({
+      show: true,
+      winAmount: totalReturn,
+      totalBet: currentTotalBet,
+      results: results
+    });
+
     // Reset local bets
     setBets(getEmptyBets());
     
-    if (hasBet) {
-      if (totalWinnings > 0) {
-         setMessage(`Thắng ${formatMoney(totalWinnings)}!`);
+    if (currentTotalBet > 0) {
+      if (totalReturn > currentTotalBet) {
+         setMessage(`Thắng lớn! +${formatMoney(totalReturn - currentTotalBet)}`);
+      } else if (totalReturn > 0) {
+         setMessage(`Hòa vốn!`);
       } else {
-         setMessage(`Thua ${formatMoney(currentTotalBet)}.`);
+         setMessage(`Thua mất ${formatMoney(currentTotalBet)} rồi.`);
       }
     } else {
       setMessage(`Kết quả: ${results.map(k => GAME_ITEMS.find(i=>i.key===k)?.name).join(', ')}.`);
@@ -260,20 +261,15 @@ const App: React.FC = () => {
       return;
     }
     
-    // 1. Update Local State
     setBalance(prev => prev - BET_INCREMENT);
     setBets((prev) => ({ ...prev, [key]: (prev[key] || 0) + BET_INCREMENT }));
 
-    // 2. Sync with Host
     if (role === 'CLIENT') {
-      // Send only the increment action
-      // We stored the connection in connectionsRef inside joinRoomAsClient
       const conn = connectionsRef.current[0];
       if (conn && conn.open) {
         conn.send({ type: 'PLACE_BET', key, amount: BET_INCREMENT });
       }
     } else if (role === 'HOST') {
-      // Host updates their own entry in the map
       const hostBets = allPlayersBetsRef.current.get('HOST') || getEmptyBets();
       hostBets[key] += BET_INCREMENT;
       allPlayersBetsRef.current.set('HOST', hostBets);
@@ -284,7 +280,6 @@ const App: React.FC = () => {
   const handleResetBets = () => {
     if (isShaking) return;
     
-    // 1. Refund Local
     let totalBets = 0;
     (Object.keys(bets) as GameItemKey[]).forEach(key => {
       totalBets += bets[key];
@@ -293,7 +288,6 @@ const App: React.FC = () => {
     setBets(getEmptyBets());
     setMessage("Đã hoàn tiền.");
 
-    // 2. Sync with Host
     if (role === 'CLIENT') {
       const conn = connectionsRef.current[0];
       if (conn && conn.open) {
@@ -309,6 +303,7 @@ const App: React.FC = () => {
     if (role === 'CLIENT') return;
     
     setIsShaking(true);
+    setResultState(null); // Clear previous result
     setMessage("Đang lắc...");
 
     broadcast({ type: 'SHAKE_START' });
@@ -324,11 +319,8 @@ const App: React.FC = () => {
       setIsShaking(false);
       broadcast({ type: 'SHAKE_RESULT', results: newResults });
       
-      // Calculate Host winnings locally
       calculateWinnings(newResults);
       
-      // Reset Global Bets Map for next round
-      // Fixed TS unused variable error by renaming 'value' to '_'
       allPlayersBetsRef.current.forEach((_, key) => {
         allPlayersBetsRef.current.set(key, getEmptyBets());
       });
@@ -362,6 +354,16 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen bg-[url('https://www.transparenttextures.com/patterns/red-paper.png')] bg-fixed flex flex-col items-center pb-12 relative">
       
+      {/* Result Overlay */}
+      {resultState && resultState.show && (
+        <ResultOverlay 
+          winAmount={resultState.winAmount}
+          totalBet={resultState.totalBet}
+          results={resultState.results}
+          onClose={() => setResultState(prev => prev ? { ...prev, show: false } : null)}
+        />
+      )}
+
       {/* Room Control */}
       <RoomControl 
         currentRoomId={roomId} 
@@ -401,7 +403,7 @@ const App: React.FC = () => {
           {message}
         </div>
 
-        {/* Betting Board - Pass globalBets here */}
+        {/* Betting Board */}
         <section className="w-full">
            <BettingBoard 
              bets={bets} 
