@@ -1,36 +1,48 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import Peer, { DataConnection } from 'peerjs';
-import { GameItemKey, NetworkMessage, PlayerRole } from './types';
+import { GameItemKey, NetworkMessage, PlayerRole, PlayerInfo } from './types';
 import { GAME_ITEMS, BET_INCREMENT, INITIAL_BALANCE, SHAKE_DURATION } from './constants';
 import DiceContainer from './components/DiceContainer';
 import BettingBoard from './components/BettingBoard';
 import RoomControl from './components/RoomControl';
 import ResultOverlay from './components/ResultOverlay';
+import Leaderboard from './components/Leaderboard';
 
 // Utility for formatting money
 const formatMoney = (amount: number) => 
   new Intl.NumberFormat('vi-VN').format(amount) + 'đ';
 
-// PeerJS ID Prefix to avoid public ID collisions
+// PeerJS ID Prefix
 const APP_PREFIX = 'baucuatet2025-';
 
-// Helper to get empty bets object
+// Random Name Generator
+const generateName = () => {
+  const adjs = ['Đại Gia', 'Tỷ Phú', 'Thần Tài', 'Vua', 'Trùm'];
+  const names = ['A', 'B', 'C', 'X', 'Y', 'Z', 'Tâm', 'Phát', 'Lộc'];
+  return `${adjs[Math.floor(Math.random() * adjs.length)]} ${names[Math.floor(Math.random() * names.length)]}`;
+};
+
 const getEmptyBets = (): Record<GameItemKey, number> => ({
   NAI: 0, BAU: 0, GA: 0, CA: 0, CUA: 0, TOM: 0
 });
 
 const App: React.FC = () => {
-  // --- Game State (Local Player) ---
+  // --- Local Player State ---
+  const [myId, setMyId] = useState<string>('');
+  const [myName] = useState<string>(() => {
+    return localStorage.getItem('playerName') || generateName();
+  });
   const [balance, setBalance] = useState<number>(INITIAL_BALANCE);
   const [bets, setBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
   
-  // --- Shared State (Room Info) ---
+  // --- Shared State ---
   const [globalBets, setGlobalBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
   const [isShaking, setIsShaking] = useState<boolean>(false);
   const [diceResult, setDiceResult] = useState<GameItemKey[]>(['NAI', 'BAU', 'GA']);
   const [message, setMessage] = useState<string>("Chúc Mừng Năm Mới! Hãy đặt cược để lấy hên!");
+  const [leaderboard, setLeaderboard] = useState<PlayerInfo[]>([]);
   
-  // Result Overlay State
+  // Result Overlay
   const [resultState, setResultState] = useState<{
     show: boolean;
     winAmount: number;
@@ -41,33 +53,47 @@ const App: React.FC = () => {
   // --- Network State ---
   const [roomId, setRoomId] = useState<string | null>(null);
   const [role, setRole] = useState<PlayerRole>('OFFLINE');
-  const [playerCount, setPlayerCount] = useState<number>(1); // Host counts as 1
 
-  // Refs for Network Logic (avoid stale closures)
+  // Refs
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
-  
-  // HOST ONLY: Track bets from ALL players (Map<PeerID, Bets>)
-  // 'HOST' key is used for the Host's own bets
   const allPlayersBetsRef = useRef<Map<string, Record<GameItemKey, number>>>(new Map());
+  
+  // HOST ONLY: Map of all connected players to track their info
+  const playersInfoRef = useRef<Map<string, PlayerInfo>>(new Map());
 
   // --- Initialization ---
   useEffect(() => {
+    localStorage.setItem('playerName', myName);
     const params = new URLSearchParams(window.location.search);
     const roomParam = params.get('room');
-
-    if (roomParam) {
-      joinRoomAsClient(roomParam);
-    }
+    if (roomParam) joinRoomAsClient(roomParam);
 
     return () => {
       if (peerRef.current) peerRef.current.destroy();
     };
   }, []);
 
-  // --- Helpers for Host Logic ---
+  // --- Sync my info to Host whenever balance changes ---
+  useEffect(() => {
+    if (role === 'CLIENT' && myId) {
+      const msg: NetworkMessage = {
+        type: 'PLAYER_UPDATE',
+        info: { id: myId, name: myName, balance, isHost: false }
+      };
+      // Send to host
+      if (connectionsRef.current[0]?.open) {
+        connectionsRef.current[0].send(msg);
+      }
+    } else if (role === 'HOST' && myId) {
+      // Host updates their own info in the map directly
+      playersInfoRef.current.set(myId, { id: myId, name: myName, balance, isHost: true });
+      updateAndBroadcastLeaderboard();
+    }
+  }, [balance, role, myId, myName]);
 
-  // Calculate total bets from the Map (Always fresh data)
+  // --- Host Helpers ---
+
   const calculateGlobalBetsFromRef = useCallback(() => {
     const newGlobalBets = getEmptyBets();
     allPlayersBetsRef.current.forEach((playerBets) => {
@@ -80,84 +106,76 @@ const App: React.FC = () => {
 
   const broadcast = useCallback((msg: NetworkMessage) => {
     connectionsRef.current.forEach(conn => {
-      if (conn.open) {
-        conn.send(msg);
-      }
+      if (conn.open) conn.send(msg);
     });
   }, []);
 
   const updateAndBroadcastGlobalBets = useCallback(() => {
     const freshGlobalBets = calculateGlobalBetsFromRef();
-    setGlobalBets(freshGlobalBets); // Update Host UI
-    broadcast({ type: 'UPDATE_GLOBAL_BETS', bets: freshGlobalBets }); // Send to Clients
+    setGlobalBets(freshGlobalBets);
+    broadcast({ type: 'UPDATE_GLOBAL_BETS', bets: freshGlobalBets });
   }, [broadcast, calculateGlobalBetsFromRef]);
 
+  const updateAndBroadcastLeaderboard = useCallback(() => {
+    const playersList = Array.from(playersInfoRef.current.values());
+    setLeaderboard(playersList);
+    broadcast({ type: 'LEADERBOARD_UPDATE', players: playersList });
+  }, [broadcast]);
 
-  // --- Network Setup Functions ---
+  // --- Network Setup ---
 
   const initHostPeer = (attemptId: string) => {
     if (peerRef.current) peerRef.current.destroy();
     connectionsRef.current = [];
     allPlayersBetsRef.current.clear();
+    playersInfoRef.current.clear();
     
-    // Initialize Host's empty bets in the map
-    allPlayersBetsRef.current.set('HOST', getEmptyBets());
-
     const fullId = APP_PREFIX + attemptId;
     const peer = new Peer(fullId);
     
-    peer.on('open', (id) => {
-      console.log('HOST Connected with ID:', id);
+    peer.on('open', () => {
+      console.log('HOST ID:', fullId);
       setRole('HOST');
       setRoomId(attemptId);
+      setMyId(fullId); // Host uses PeerID as ID
       peerRef.current = peer;
-      setMessage("Phòng đã tạo! Hãy mời bạn bè.");
+      setMessage("Phòng đã tạo! Đợi người chơi...");
 
-      try {
-        const newPath = `?room=${attemptId}`;
-        window.history.pushState({}, '', newPath);
-      } catch (e) {
-        // ignore
-      }
+      // Init Host info
+      allPlayersBetsRef.current.set(fullId, getEmptyBets());
+      playersInfoRef.current.set(fullId, { id: fullId, name: myName, balance, isHost: true });
+      updateAndBroadcastLeaderboard();
+      
+      window.history.pushState({}, '', `?room=${attemptId}`);
     });
 
     peer.on('connection', (conn) => {
-      console.log('Client connected:', conn.peer);
       connectionsRef.current.push(conn);
-      setPlayerCount(prev => prev + 1);
-      
-      // Initialize new client's bets
       allPlayersBetsRef.current.set(conn.peer, getEmptyBets());
 
-      conn.on('data', (data) => {
-        handleHostReceivedMessage(data as NetworkMessage, conn.peer);
-      });
+      conn.on('data', (data) => handleHostReceivedMessage(data as NetworkMessage, conn.peer));
       
       conn.on('open', () => {
-         // IMPORTANT: Calculate fresh global bets right now to send to the new guy
-         const freshGlobal = calculateGlobalBetsFromRef();
-         conn.send({ type: 'UPDATE_GLOBAL_BETS', bets: freshGlobal });
-         
-         // If a shake was in progress or finished, we could sync that too, 
-         // but for now let's just sync the bets.
+         // Sync state to new client
+         conn.send({ type: 'UPDATE_GLOBAL_BETS', bets: calculateGlobalBetsFromRef() });
+         conn.send({ type: 'LEADERBOARD_UPDATE', players: Array.from(playersInfoRef.current.values()) });
+         // If a shake happened recently, we could sync that too, but let's keep it simple
       });
       
       conn.on('close', () => {
-        console.log('Client disconnected:', conn.peer);
         connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
-        setPlayerCount(prev => Math.max(1, prev - 1));
         allPlayersBetsRef.current.delete(conn.peer);
+        playersInfoRef.current.delete(conn.peer); // Remove from leaderboard
         updateAndBroadcastGlobalBets();
+        updateAndBroadcastLeaderboard();
       });
     });
 
     peer.on('error', (err) => {
-      console.error('Peer Error:', err);
       if (err.type === 'unavailable-id') {
-        const newId = Math.random().toString(36).substring(2, 8).toUpperCase();
-        initHostPeer(newId);
+        initHostPeer(Math.random().toString(36).substring(2, 8).toUpperCase());
       } else {
-        setMessage("Lỗi tạo phòng. Hãy thử lại.");
+        setMessage("Lỗi mạng. Vui lòng tải lại.");
       }
     });
   };
@@ -168,59 +186,60 @@ const App: React.FC = () => {
 
     const peer = new Peer();
 
-    peer.on('open', (myId) => {
-      console.log('CLIENT Me:', myId);
+    peer.on('open', (id) => {
       setRole('CLIENT');
       setRoomId(targetRoomId);
+      setMyId(id);
       peerRef.current = peer;
-      setMessage("Đang kết nối...");
+      setMessage("Đang vào phòng...");
 
       const conn = peer.connect(APP_PREFIX + targetRoomId);
       connectionsRef.current = [conn];
 
       conn.on('open', () => {
-        setMessage("Đã vào phòng! Hãy đặt cược.");
+        setMessage("Đã kết nối! Đặt cược đi.");
+        // Immediately send my info
+        conn.send({ 
+          type: 'PLAYER_UPDATE', 
+          info: { id, name: myName, balance, isHost: false } 
+        } as NetworkMessage);
       });
 
-      conn.on('data', (data: unknown) => {
-        handleClientReceivedMessage(data as NetworkMessage);
-      });
-
+      conn.on('data', (data) => handleClientReceivedMessage(data as NetworkMessage));
+      
       conn.on('close', () => {
         setMessage("Mất kết nối với chủ phòng.");
         setRole('OFFLINE');
       });
-      
-      conn.on('error', (err) => {
-         console.error("Connection Error", err);
-         setMessage("Không tìm thấy phòng này.");
-      });
+
+      conn.on('error', () => setMessage("Không tìm thấy phòng này."));
     });
   };
 
   // --- Message Handlers ---
 
-  // HOST: Handle messages from Clients
   const handleHostReceivedMessage = (msg: NetworkMessage, peerId: string) => {
     if (msg.type === 'PLACE_BET') {
       const playerBets = allPlayersBetsRef.current.get(peerId) || getEmptyBets();
       playerBets[msg.key] += msg.amount;
       allPlayersBetsRef.current.set(peerId, playerBets);
-      
-      // Update everyone about the new total
       updateAndBroadcastGlobalBets();
     } 
     else if (msg.type === 'RESET_BETS') {
       allPlayersBetsRef.current.set(peerId, getEmptyBets());
       updateAndBroadcastGlobalBets();
     }
+    else if (msg.type === 'PLAYER_UPDATE') {
+      // Update player info registry
+      playersInfoRef.current.set(peerId, msg.info);
+      updateAndBroadcastLeaderboard();
+    }
   };
 
-  // CLIENT: Handle messages from Host
   const handleClientReceivedMessage = (msg: NetworkMessage) => {
     if (msg.type === 'SHAKE_START') {
       setIsShaking(true);
-      setResultState(null); 
+      setResultState(null);
       setMessage("Chủ phòng đang lắc...");
     } else if (msg.type === 'SHAKE_RESULT') {
       setIsShaking(false);
@@ -228,10 +247,12 @@ const App: React.FC = () => {
       calculateWinnings(msg.results);
     } else if (msg.type === 'UPDATE_GLOBAL_BETS') {
       setGlobalBets(msg.bets);
+    } else if (msg.type === 'LEADERBOARD_UPDATE') {
+      setLeaderboard(msg.players);
     }
   };
 
-  // --- Game Actions ---
+  // --- Game Logic ---
 
   const calculateWinnings = (results: GameItemKey[]) => {
     let totalReturn = 0; 
@@ -240,7 +261,6 @@ const App: React.FC = () => {
 
     let currentTotalBet = 0;
     
-    // Calculate based on LOCAL bets
     (Object.keys(bets) as GameItemKey[]).forEach(key => {
       const betAmount = bets[key];
       const appearances = counts[key] || 0;
@@ -253,10 +273,8 @@ const App: React.FC = () => {
       }
     });
 
-    // Update Wallet
-    setBalance(prev => prev + totalReturn);
+    setBalance(prev => prev + totalReturn); // Trigger useEffect -> PLAYER_UPDATE
 
-    // Show Result Overlay
     setResultState({
       show: true,
       winAmount: totalReturn,
@@ -264,20 +282,15 @@ const App: React.FC = () => {
       results: results
     });
 
-    // Clear LOCAL bets for next round
     setBets(getEmptyBets());
     
-    // UI Feedback
     if (currentTotalBet > 0) {
-      if (totalReturn > currentTotalBet) {
-         setMessage(`Thắng +${formatMoney(totalReturn - currentTotalBet)}!`);
-      } else if (totalReturn > 0) {
-         setMessage(`Hòa vốn.`);
-      } else {
-         setMessage(`Thua ${formatMoney(currentTotalBet)}.`);
-      }
+       // Messages handled by ResultOverlay visually, but we update text bar too
+       if (totalReturn > currentTotalBet) setMessage(`Thắng +${formatMoney(totalReturn - currentTotalBet)}!`);
+       else if (totalReturn > 0) setMessage(`Hòa vốn.`);
+       else setMessage(`Thua ${formatMoney(currentTotalBet)}.`);
     } else {
-      setMessage(`Kết quả: ${results.map(k => GAME_ITEMS.find(i=>i.key===k)?.name).join(', ')}.`);
+       setMessage("Kết quả đã có!");
     }
   };
 
@@ -288,27 +301,17 @@ const App: React.FC = () => {
       return;
     }
     
-    // 1. Update LOCAL state immediately (Optimistic UI)
-    setBalance(prev => prev - BET_INCREMENT);
+    setBalance(prev => prev - BET_INCREMENT); // Trigger useEffect -> PLAYER_UPDATE
     setBets((prev) => ({ ...prev, [key]: (prev[key] || 0) + BET_INCREMENT }));
 
-    // 2. Network Sync
     if (role === 'CLIENT') {
-      // Send to Host
-      const conn = connectionsRef.current[0];
-      if (conn && conn.open) {
-        conn.send({ type: 'PLACE_BET', key, amount: BET_INCREMENT });
-      } else {
-        // Fallback if offline? For now just allow local play but warn
-        // setMessage("Đang chơi offline (không sync)");
+      if (connectionsRef.current[0]?.open) {
+        connectionsRef.current[0].send({ type: 'PLACE_BET', key, amount: BET_INCREMENT });
       }
     } else if (role === 'HOST') {
-      // Host updates their own record in the Map
-      const hostBets = allPlayersBetsRef.current.get('HOST') || getEmptyBets();
+      const hostBets = allPlayersBetsRef.current.get(myId) || getEmptyBets();
       hostBets[key] += BET_INCREMENT;
-      allPlayersBetsRef.current.set('HOST', hostBets);
-      
-      // Update everyone
+      allPlayersBetsRef.current.set(myId, hostBets);
       updateAndBroadcastGlobalBets();
     }
   };
@@ -316,23 +319,17 @@ const App: React.FC = () => {
   const handleResetBets = () => {
     if (isShaking) return;
     
-    // Refund Local
     let totalBets = 0;
-    (Object.keys(bets) as GameItemKey[]).forEach(key => {
-      totalBets += bets[key];
-    });
-    setBalance(prev => prev + totalBets);
+    (Object.keys(bets) as GameItemKey[]).forEach(key => totalBets += bets[key]);
+    
+    setBalance(prev => prev + totalBets); // Trigger useEffect -> PLAYER_UPDATE
     setBets(getEmptyBets());
     setMessage("Đã hoàn tiền.");
 
-    // Network Sync
     if (role === 'CLIENT') {
-      const conn = connectionsRef.current[0];
-      if (conn && conn.open) {
-        conn.send({ type: 'RESET_BETS' });
-      }
+      if (connectionsRef.current[0]?.open) connectionsRef.current[0].send({ type: 'RESET_BETS' });
     } else if (role === 'HOST') {
-      allPlayersBetsRef.current.set('HOST', getEmptyBets());
+      allPlayersBetsRef.current.set(myId, getEmptyBets());
       updateAndBroadcastGlobalBets();
     }
   };
@@ -343,42 +340,31 @@ const App: React.FC = () => {
     setIsShaking(true);
     setResultState(null); 
     setMessage("Đang lắc...");
-
     broadcast({ type: 'SHAKE_START' });
 
     setTimeout(() => {
-      // 1. Determine Results
       const newResults: GameItemKey[] = [];
       for (let i = 0; i < 3; i++) {
-        const randomIndex = Math.floor(Math.random() * GAME_ITEMS.length);
-        newResults.push(GAME_ITEMS[randomIndex].key);
+        newResults.push(GAME_ITEMS[Math.floor(Math.random() * GAME_ITEMS.length)].key);
       }
 
       setDiceResult(newResults);
       setIsShaking(false);
-      
-      // 2. Broadcast Results
       broadcast({ type: 'SHAKE_RESULT', results: newResults });
-      
-      // 3. Host calculates their own winnings locally
       calculateWinnings(newResults);
       
-      // 4. Reset Global Bets Tracking for next round
-      // Important: Keep the keys (players) but reset their values to 0
-      Array.from(allPlayersBetsRef.current.keys()).forEach(peerId => {
-        allPlayersBetsRef.current.set(peerId, getEmptyBets());
+      // Reset bets tracking
+      Array.from(allPlayersBetsRef.current.keys()).forEach(pid => {
+        allPlayersBetsRef.current.set(pid, getEmptyBets());
       });
-      
-      // 5. Sync the clean board to everyone
       updateAndBroadcastGlobalBets();
 
     }, SHAKE_DURATION);
-  }, [role, broadcast, updateAndBroadcastGlobalBets]);
+  }, [role, broadcast, updateAndBroadcastGlobalBets, myId]); // Added myId dependency
 
   const handleCreateRoomAction = () => {
     setMessage("Đang khởi tạo...");
-    const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
-    initHostPeer(newRoomId);
+    initHostPeer(Math.random().toString(36).substring(2, 8).toUpperCase());
   };
   
   const handleCopyLink = () => {
@@ -392,9 +378,8 @@ const App: React.FC = () => {
   const currentTotalBet = (Object.values(bets) as number[]).reduce((a, b) => a + b, 0);
 
   return (
-    <div className="min-h-screen bg-[url('https://www.transparenttextures.com/patterns/red-paper.png')] bg-fixed flex flex-col items-center pb-12 relative">
+    <div className="min-h-screen bg-[url('https://www.transparenttextures.com/patterns/red-paper.png')] bg-fixed flex flex-col items-center pb-12 relative overflow-x-hidden">
       
-      {/* Result Overlay */}
       {resultState && resultState.show && (
         <ResultOverlay 
           winAmount={resultState.winAmount}
@@ -404,108 +389,88 @@ const App: React.FC = () => {
         />
       )}
 
-      {/* Room Control */}
       <RoomControl 
         currentRoomId={roomId} 
         onCreateRoom={handleCreateRoomAction}
         onCopyLink={handleCopyLink}
       />
 
-      {/* Network Status Pill */}
-      {roomId && (
-        <div className="absolute top-4 left-4 z-40 bg-black/60 backdrop-blur text-white px-4 py-1.5 rounded-full text-xs font-bold flex items-center gap-2 border border-white/20 shadow-lg">
-          <div className={`w-2.5 h-2.5 rounded-full ${role === 'OFFLINE' ? 'bg-red-500' : 'bg-green-500 animate-pulse'}`}></div>
-          {role === 'HOST' ? (
-            <span>Chủ phòng • {playerCount} người online</span>
-          ) : role === 'CLIENT' ? (
-             <span>Người chơi • Đã kết nối</span>
-          ) : (
-             <span>Mất kết nối</span>
-          )}
-        </div>
-      )}
-
-      {/* Header */}
       <header className="w-full bg-tet-red border-b-4 border-tet-gold shadow-lg pt-6 pb-4 px-4 text-center relative overflow-hidden">
         <div className="absolute top-0 left-0 w-full h-full opacity-10 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-yellow-300 via-red-600 to-red-900"></div>
         <h1 className="font-display text-4xl md:text-6xl text-tet-gold drop-shadow-[0_4px_4px_rgba(0,0,0,0.5)] relative z-10">
           BẦU CUA TẾT
         </h1>
         <p className="text-tet-cream font-sans mt-2 opacity-90 relative z-10 font-bold tracking-wide">
-          {role === 'CLIENT' ? 'CHẾ ĐỘ NGƯỜI CHƠI' : role === 'HOST' ? 'CHẾ ĐỘ CHỦ PHÒNG' : 'CHƠI OFFLINE'}
+          {role === 'HOST' ? 'CHỦ PHÒNG' : role === 'CLIENT' ? 'NGƯỜI CHƠI' : 'OFFLINE'} - {myName}
         </p>
       </header>
 
-      {/* Main Game Area */}
-      <main className="flex-1 w-full max-w-4xl px-4 py-6 flex flex-col items-center gap-6">
+      <main className="flex-1 w-full max-w-5xl px-4 py-6 flex flex-col md:flex-row items-start gap-6">
         
-        {/* Dice Section */}
-        <section className="w-full">
+        {/* Left Column: Game Board */}
+        <div className="flex-1 w-full flex flex-col items-center gap-6">
           <DiceContainer isShaking={isShaking} results={diceResult} />
-        </section>
 
-        {/* Status Message */}
-        <div className="bg-tet-cream/95 text-tet-darkRed border-2 border-tet-gold rounded-xl px-6 py-3 text-center font-bold shadow-md w-full max-w-md min-h-[3.5rem] flex items-center justify-center transition-all">
-          {message}
-        </div>
+          <div className="bg-tet-cream/95 text-tet-darkRed border-2 border-tet-gold rounded-xl px-6 py-3 text-center font-bold shadow-md w-full max-w-md min-h-[3.5rem] flex items-center justify-center transition-all">
+            {message}
+          </div>
 
-        {/* Betting Board */}
-        <section className="w-full">
-           <BettingBoard 
+          <BettingBoard 
              bets={bets} 
              globalBets={globalBets} 
              onPlaceBet={handlePlaceBet} 
-             disabled={isShaking || role === 'OFFLINE' && !roomId && false /* Allow offline play if no room */} 
-            />
-        </section>
+             disabled={isShaking || (role === 'OFFLINE' && !roomId)} 
+          />
 
-        {/* Controls */}
-        <section className="w-full max-w-2xl bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-tet-gold/30 shadow-2xl sticky bottom-4 z-50">
-           <div className="flex flex-col md:flex-row items-center justify-between gap-4">
-              
-              <div className="flex flex-col items-center md:items-start min-w-[120px]">
-                 <span className="text-tet-gold text-xs uppercase font-bold tracking-wider mb-1">Ví Của Bạn</span>
-                 <div className="text-3xl font-display text-white drop-shadow-md">
-                    {formatMoney(balance)}
-                 </div>
-                 {currentTotalBet > 0 && (
-                   <span className="text-red-200 text-xs font-bold">Đang cược: {formatMoney(currentTotalBet)}</span>
-                 )}
-              </div>
+          <div className="w-full max-w-2xl bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-tet-gold/30 shadow-2xl">
+             <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
+                <div className="flex flex-col items-center sm:items-start min-w-[120px]">
+                   <span className="text-tet-gold text-xs uppercase font-bold tracking-wider mb-1">Ví Của Bạn</span>
+                   <div className="text-3xl font-display text-white drop-shadow-md">{formatMoney(balance)}</div>
+                   {currentTotalBet > 0 && <span className="text-red-200 text-xs font-bold">Cược: {formatMoney(currentTotalBet)}</span>}
+                </div>
 
-              <div className="flex items-center gap-3 w-full md:w-auto">
-                 <button 
-                   onClick={handleResetBets}
-                   disabled={isShaking || currentTotalBet === 0}
-                   className="flex-1 md:flex-none px-4 py-3 rounded-xl bg-gray-600 hover:bg-gray-500 text-white font-bold transition disabled:opacity-50 disabled:cursor-not-allowed shadow-lg border-b-4 border-gray-800 active:border-b-0 active:translate-y-1"
-                 >
-                   Hủy Cược
-                 </button>
-                 
-                 {role === 'CLIENT' ? (
+                <div className="flex gap-2 w-full sm:w-auto">
                    <button 
-                     disabled={true}
-                     className="flex-[2] md:flex-none px-6 py-3 rounded-xl bg-gray-400 text-gray-800 font-display text-lg md:text-xl uppercase tracking-wider cursor-not-allowed opacity-80 border-b-4 border-gray-600 shadow-lg"
+                     onClick={handleResetBets}
+                     disabled={isShaking || currentTotalBet === 0}
+                     className="flex-1 px-4 py-3 rounded-xl bg-gray-600 text-white font-bold border-b-4 border-gray-800 active:border-b-0 active:translate-y-1 disabled:opacity-50"
                    >
-                     {isShaking ? 'Đang Lắc...' : 'Chờ Nhà Cái'}
+                     Hủy
                    </button>
-                 ) : (
-                   <button 
-                     onClick={handleHostShake}
-                     disabled={isShaking}
-                     className="flex-[2] md:flex-none px-8 py-3 rounded-xl bg-gradient-to-r from-yellow-400 to-yellow-600 hover:from-yellow-300 hover:to-yellow-500 text-red-900 font-display text-xl uppercase tracking-wider transition disabled:opacity-50 disabled:cursor-not-allowed shadow-lg border-b-4 border-yellow-700 active:border-b-0 active:translate-y-1 animate-pulse"
-                   >
-                     {isShaking ? 'Đang Lắc...' : 'Xốc Đĩa!'}
-                   </button>
-                 )}
-              </div>
-           </div>
-        </section>
+                   
+                   {role === 'CLIENT' ? (
+                     <button disabled className="flex-[2] px-6 py-3 rounded-xl bg-gray-400 text-gray-800 font-display text-lg border-b-4 border-gray-600 cursor-not-allowed">
+                       {isShaking ? 'Đang Lắc...' : 'Chờ Nhà Cái'}
+                     </button>
+                   ) : (
+                     <button 
+                       onClick={handleHostShake}
+                       disabled={isShaking}
+                       className="flex-[2] px-8 py-3 rounded-xl bg-gradient-to-r from-yellow-400 to-yellow-600 text-red-900 font-display text-lg border-b-4 border-yellow-700 active:border-b-0 active:translate-y-1 disabled:opacity-50"
+                     >
+                       {isShaking ? 'Đang Lắc...' : 'Xốc Đĩa!'}
+                     </button>
+                   )}
+                </div>
+             </div>
+          </div>
+        </div>
+
+        {/* Right Column: Leaderboard */}
+        <div className="w-full md:w-80 flex-shrink-0">
+          <Leaderboard players={leaderboard} currentUserId={myId} />
+          
+          <div className="mt-4 bg-black/20 p-4 rounded-xl text-center text-xs text-tet-cream/60">
+             <p>Chia sẻ link hoặc mã QR để mời bạn bè.</p>
+             <p className="mt-1">Mỗi người chơi có ví tiền riêng.</p>
+          </div>
+        </div>
 
       </main>
 
       <footer className="w-full text-center py-4 text-red-300 text-xs">
-         © 2025 Game Bầu Cua Online - PeerJS P2P
+         © 2025 Game Bầu Cua Online
       </footer>
     </div>
   );
