@@ -20,19 +20,20 @@ const getEmptyBets = (): Record<GameItemKey, number> => ({
 });
 
 const App: React.FC = () => {
-  // --- Game State ---
+  // --- Game State (Local Player) ---
   const [balance, setBalance] = useState<number>(INITIAL_BALANCE);
   const [bets, setBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
-  const [globalBets, setGlobalBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
   
+  // --- Shared State (Room Info) ---
+  const [globalBets, setGlobalBets] = useState<Record<GameItemKey, number>>(getEmptyBets());
   const [isShaking, setIsShaking] = useState<boolean>(false);
   const [diceResult, setDiceResult] = useState<GameItemKey[]>(['NAI', 'BAU', 'GA']);
   const [message, setMessage] = useState<string>("Chúc Mừng Năm Mới! Hãy đặt cược để lấy hên!");
   
-  // New State for Result Overlay
+  // Result Overlay State
   const [resultState, setResultState] = useState<{
     show: boolean;
-    winAmount: number; // Total returned (profit + capital)
+    winAmount: number;
     totalBet: number;
     results: GameItemKey[];
   } | null>(null);
@@ -40,16 +41,17 @@ const App: React.FC = () => {
   // --- Network State ---
   const [roomId, setRoomId] = useState<string | null>(null);
   const [role, setRole] = useState<PlayerRole>('OFFLINE');
-  const [playerCount, setPlayerCount] = useState<number>(1);
+  const [playerCount, setPlayerCount] = useState<number>(1); // Host counts as 1
 
-  // Refs for managing Peer lifecycle without re-renders
+  // Refs for Network Logic (avoid stale closures)
   const peerRef = useRef<Peer | null>(null);
   const connectionsRef = useRef<DataConnection[]>([]);
   
-  // HOST ONLY: Track bets from all players to aggregate totals
+  // HOST ONLY: Track bets from ALL players (Map<PeerID, Bets>)
+  // 'HOST' key is used for the Host's own bets
   const allPlayersBetsRef = useRef<Map<string, Record<GameItemKey, number>>>(new Map());
 
-  // --- Initialization Effect ---
+  // --- Initialization ---
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const roomParam = params.get('room');
@@ -58,19 +60,48 @@ const App: React.FC = () => {
       joinRoomAsClient(roomParam);
     }
 
-    // Cleanup on unmount
     return () => {
-      if (peerRef.current) {
-        peerRef.current.destroy();
-      }
+      if (peerRef.current) peerRef.current.destroy();
     };
   }, []);
 
-  // --- Network Functions ---
+  // --- Helpers for Host Logic ---
+
+  // Calculate total bets from the Map (Always fresh data)
+  const calculateGlobalBetsFromRef = useCallback(() => {
+    const newGlobalBets = getEmptyBets();
+    allPlayersBetsRef.current.forEach((playerBets) => {
+      (Object.keys(playerBets) as GameItemKey[]).forEach((key) => {
+        newGlobalBets[key] += playerBets[key];
+      });
+    });
+    return newGlobalBets;
+  }, []);
+
+  const broadcast = useCallback((msg: NetworkMessage) => {
+    connectionsRef.current.forEach(conn => {
+      if (conn.open) {
+        conn.send(msg);
+      }
+    });
+  }, []);
+
+  const updateAndBroadcastGlobalBets = useCallback(() => {
+    const freshGlobalBets = calculateGlobalBetsFromRef();
+    setGlobalBets(freshGlobalBets); // Update Host UI
+    broadcast({ type: 'UPDATE_GLOBAL_BETS', bets: freshGlobalBets }); // Send to Clients
+  }, [broadcast, calculateGlobalBetsFromRef]);
+
+
+  // --- Network Setup Functions ---
 
   const initHostPeer = (attemptId: string) => {
     if (peerRef.current) peerRef.current.destroy();
     connectionsRef.current = [];
+    allPlayersBetsRef.current.clear();
+    
+    // Initialize Host's empty bets in the map
+    allPlayersBetsRef.current.set('HOST', getEmptyBets());
 
     const fullId = APP_PREFIX + attemptId;
     const peer = new Peer(fullId);
@@ -81,13 +112,12 @@ const App: React.FC = () => {
       setRoomId(attemptId);
       peerRef.current = peer;
       setMessage("Phòng đã tạo! Hãy mời bạn bè.");
-      allPlayersBetsRef.current.set('HOST', getEmptyBets());
 
       try {
         const newPath = `?room=${attemptId}`;
         window.history.pushState({}, '', newPath);
       } catch (e) {
-        console.warn('URL update skipped:', e);
+        // ignore
       }
     });
 
@@ -96,6 +126,7 @@ const App: React.FC = () => {
       connectionsRef.current.push(conn);
       setPlayerCount(prev => prev + 1);
       
+      // Initialize new client's bets
       allPlayersBetsRef.current.set(conn.peer, getEmptyBets());
 
       conn.on('data', (data) => {
@@ -103,10 +134,16 @@ const App: React.FC = () => {
       });
       
       conn.on('open', () => {
-         conn.send({ type: 'UPDATE_GLOBAL_BETS', bets: globalBets });
+         // IMPORTANT: Calculate fresh global bets right now to send to the new guy
+         const freshGlobal = calculateGlobalBetsFromRef();
+         conn.send({ type: 'UPDATE_GLOBAL_BETS', bets: freshGlobal });
+         
+         // If a shake was in progress or finished, we could sync that too, 
+         // but for now let's just sync the bets.
       });
       
       conn.on('close', () => {
+        console.log('Client disconnected:', conn.peer);
         connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
         setPlayerCount(prev => Math.max(1, prev - 1));
         allPlayersBetsRef.current.delete(conn.peer);
@@ -120,7 +157,7 @@ const App: React.FC = () => {
         const newId = Math.random().toString(36).substring(2, 8).toUpperCase();
         initHostPeer(newId);
       } else {
-        setMessage("Lỗi kết nối mạng.");
+        setMessage("Lỗi tạo phòng. Hãy thử lại.");
       }
     });
   };
@@ -136,13 +173,13 @@ const App: React.FC = () => {
       setRole('CLIENT');
       setRoomId(targetRoomId);
       peerRef.current = peer;
-      setMessage("Đang kết nối tới chủ phòng...");
+      setMessage("Đang kết nối...");
 
       const conn = peer.connect(APP_PREFIX + targetRoomId);
       connectionsRef.current = [conn];
 
       conn.on('open', () => {
-        setMessage("Đã vào phòng! Chờ chủ phòng lắc.");
+        setMessage("Đã vào phòng! Hãy đặt cược.");
       });
 
       conn.on('data', (data: unknown) => {
@@ -150,22 +187,27 @@ const App: React.FC = () => {
       });
 
       conn.on('close', () => {
-        setMessage("Chủ phòng đã thoát.");
+        setMessage("Mất kết nối với chủ phòng.");
         setRole('OFFLINE');
       });
       
       conn.on('error', (err) => {
          console.error("Connection Error", err);
-         setMessage("Không thể kết nối tới phòng này.");
+         setMessage("Không tìm thấy phòng này.");
       });
     });
   };
 
+  // --- Message Handlers ---
+
+  // HOST: Handle messages from Clients
   const handleHostReceivedMessage = (msg: NetworkMessage, peerId: string) => {
     if (msg.type === 'PLACE_BET') {
       const playerBets = allPlayersBetsRef.current.get(peerId) || getEmptyBets();
       playerBets[msg.key] += msg.amount;
       allPlayersBetsRef.current.set(peerId, playerBets);
+      
+      // Update everyone about the new total
       updateAndBroadcastGlobalBets();
     } 
     else if (msg.type === 'RESET_BETS') {
@@ -174,21 +216,11 @@ const App: React.FC = () => {
     }
   };
 
-  const updateAndBroadcastGlobalBets = () => {
-    const newGlobalBets = getEmptyBets();
-    allPlayersBetsRef.current.forEach((playerBets) => {
-      (Object.keys(playerBets) as GameItemKey[]).forEach((key) => {
-        newGlobalBets[key] += playerBets[key];
-      });
-    });
-    setGlobalBets(newGlobalBets);
-    broadcast({ type: 'UPDATE_GLOBAL_BETS', bets: newGlobalBets });
-  };
-
+  // CLIENT: Handle messages from Host
   const handleClientReceivedMessage = (msg: NetworkMessage) => {
     if (msg.type === 'SHAKE_START') {
       setIsShaking(true);
-      setResultState(null); // Clear previous result overlay
+      setResultState(null); 
       setMessage("Chủ phòng đang lắc...");
     } else if (msg.type === 'SHAKE_RESULT') {
       setIsShaking(false);
@@ -199,23 +231,16 @@ const App: React.FC = () => {
     }
   };
 
-  const broadcast = (msg: NetworkMessage) => {
-    connectionsRef.current.forEach(conn => {
-      if (conn.open) {
-        conn.send(msg);
-      }
-    });
-  };
-
-  // --- Game Logic ---
+  // --- Game Actions ---
 
   const calculateWinnings = (results: GameItemKey[]) => {
-    let totalReturn = 0; // Includes initial bet + profit
+    let totalReturn = 0; 
     const counts: Record<string, number> = {};
     results.forEach(x => { counts[x] = (counts[x] || 0) + 1; });
 
     let currentTotalBet = 0;
     
+    // Calculate based on LOCAL bets
     (Object.keys(bets) as GameItemKey[]).forEach(key => {
       const betAmount = bets[key];
       const appearances = counts[key] || 0;
@@ -228,9 +253,10 @@ const App: React.FC = () => {
       }
     });
 
+    // Update Wallet
     setBalance(prev => prev + totalReturn);
 
-    // Show Overlay Result
+    // Show Result Overlay
     setResultState({
       show: true,
       winAmount: totalReturn,
@@ -238,16 +264,17 @@ const App: React.FC = () => {
       results: results
     });
 
-    // Reset local bets
+    // Clear LOCAL bets for next round
     setBets(getEmptyBets());
     
+    // UI Feedback
     if (currentTotalBet > 0) {
       if (totalReturn > currentTotalBet) {
-         setMessage(`Thắng lớn! +${formatMoney(totalReturn - currentTotalBet)}`);
+         setMessage(`Thắng +${formatMoney(totalReturn - currentTotalBet)}!`);
       } else if (totalReturn > 0) {
-         setMessage(`Hòa vốn!`);
+         setMessage(`Hòa vốn.`);
       } else {
-         setMessage(`Thua mất ${formatMoney(currentTotalBet)} rồi.`);
+         setMessage(`Thua ${formatMoney(currentTotalBet)}.`);
       }
     } else {
       setMessage(`Kết quả: ${results.map(k => GAME_ITEMS.find(i=>i.key===k)?.name).join(', ')}.`);
@@ -257,22 +284,31 @@ const App: React.FC = () => {
   const handlePlaceBet = (key: GameItemKey) => {
     if (isShaking) return;
     if (balance < BET_INCREMENT) {
-      setMessage("Không đủ tiền!");
+      setMessage("Hết tiền rồi!");
       return;
     }
     
+    // 1. Update LOCAL state immediately (Optimistic UI)
     setBalance(prev => prev - BET_INCREMENT);
     setBets((prev) => ({ ...prev, [key]: (prev[key] || 0) + BET_INCREMENT }));
 
+    // 2. Network Sync
     if (role === 'CLIENT') {
+      // Send to Host
       const conn = connectionsRef.current[0];
       if (conn && conn.open) {
         conn.send({ type: 'PLACE_BET', key, amount: BET_INCREMENT });
+      } else {
+        // Fallback if offline? For now just allow local play but warn
+        // setMessage("Đang chơi offline (không sync)");
       }
     } else if (role === 'HOST') {
+      // Host updates their own record in the Map
       const hostBets = allPlayersBetsRef.current.get('HOST') || getEmptyBets();
       hostBets[key] += BET_INCREMENT;
       allPlayersBetsRef.current.set('HOST', hostBets);
+      
+      // Update everyone
       updateAndBroadcastGlobalBets();
     }
   };
@@ -280,6 +316,7 @@ const App: React.FC = () => {
   const handleResetBets = () => {
     if (isShaking) return;
     
+    // Refund Local
     let totalBets = 0;
     (Object.keys(bets) as GameItemKey[]).forEach(key => {
       totalBets += bets[key];
@@ -288,6 +325,7 @@ const App: React.FC = () => {
     setBets(getEmptyBets());
     setMessage("Đã hoàn tiền.");
 
+    // Network Sync
     if (role === 'CLIENT') {
       const conn = connectionsRef.current[0];
       if (conn && conn.open) {
@@ -300,15 +338,16 @@ const App: React.FC = () => {
   };
 
   const handleHostShake = useCallback(() => {
-    if (role === 'CLIENT') return;
+    if (role !== 'HOST') return;
     
     setIsShaking(true);
-    setResultState(null); // Clear previous result
+    setResultState(null); 
     setMessage("Đang lắc...");
 
     broadcast({ type: 'SHAKE_START' });
 
     setTimeout(() => {
+      // 1. Determine Results
       const newResults: GameItemKey[] = [];
       for (let i = 0; i < 3; i++) {
         const randomIndex = Math.floor(Math.random() * GAME_ITEMS.length);
@@ -317,35 +356,36 @@ const App: React.FC = () => {
 
       setDiceResult(newResults);
       setIsShaking(false);
+      
+      // 2. Broadcast Results
       broadcast({ type: 'SHAKE_RESULT', results: newResults });
       
+      // 3. Host calculates their own winnings locally
       calculateWinnings(newResults);
       
-      allPlayersBetsRef.current.forEach((_, key) => {
-        allPlayersBetsRef.current.set(key, getEmptyBets());
+      // 4. Reset Global Bets Tracking for next round
+      // Important: Keep the keys (players) but reset their values to 0
+      Array.from(allPlayersBetsRef.current.keys()).forEach(peerId => {
+        allPlayersBetsRef.current.set(peerId, getEmptyBets());
       });
+      
+      // 5. Sync the clean board to everyone
       updateAndBroadcastGlobalBets();
 
     }, SHAKE_DURATION);
-  }, [bets, role]);
+  }, [role, broadcast, updateAndBroadcastGlobalBets]);
 
   const handleCreateRoomAction = () => {
-    setMessage("Đang tạo phòng...");
+    setMessage("Đang khởi tạo...");
     const newRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
     initHostPeer(newRoomId);
   };
   
   const handleCopyLink = () => {
     if (roomId) {
-      try {
-        const url = new URL(window.location.href);
-        url.searchParams.set('room', roomId);
-        navigator.clipboard.writeText(url.toString());
-        alert('Đã sao chép link!');
-      } catch (e) {
-        navigator.clipboard.writeText(window.location.href);
-        alert('Đã sao chép link!');
-      }
+      const url = window.location.href.split('?')[0] + '?room=' + roomId;
+      navigator.clipboard.writeText(url);
+      alert('Đã sao chép link phòng!');
     }
   };
 
@@ -373,9 +413,15 @@ const App: React.FC = () => {
 
       {/* Network Status Pill */}
       {roomId && (
-        <div className="absolute top-4 left-4 z-40 bg-black/50 backdrop-blur text-white px-3 py-1 rounded-full text-xs flex items-center gap-2">
-          <div className={`w-2 h-2 rounded-full ${role === 'OFFLINE' ? 'bg-red-500' : 'bg-green-500 animate-pulse'}`}></div>
-          {role === 'HOST' ? `Chủ phòng (${playerCount})` : role === 'CLIENT' ? 'Đã tham gia' : 'Mất kết nối'}
+        <div className="absolute top-4 left-4 z-40 bg-black/60 backdrop-blur text-white px-4 py-1.5 rounded-full text-xs font-bold flex items-center gap-2 border border-white/20 shadow-lg">
+          <div className={`w-2.5 h-2.5 rounded-full ${role === 'OFFLINE' ? 'bg-red-500' : 'bg-green-500 animate-pulse'}`}></div>
+          {role === 'HOST' ? (
+            <span>Chủ phòng • {playerCount} người online</span>
+          ) : role === 'CLIENT' ? (
+             <span>Người chơi • Đã kết nối</span>
+          ) : (
+             <span>Mất kết nối</span>
+          )}
         </div>
       )}
 
@@ -385,8 +431,8 @@ const App: React.FC = () => {
         <h1 className="font-display text-4xl md:text-6xl text-tet-gold drop-shadow-[0_4px_4px_rgba(0,0,0,0.5)] relative z-10">
           BẦU CUA TẾT
         </h1>
-        <p className="text-tet-cream font-sans mt-2 opacity-90 relative z-10">
-          {role === 'CLIENT' ? 'Chế độ người chơi' : 'Vận may đầu năm'}
+        <p className="text-tet-cream font-sans mt-2 opacity-90 relative z-10 font-bold tracking-wide">
+          {role === 'CLIENT' ? 'CHẾ ĐỘ NGƯỜI CHƠI' : role === 'HOST' ? 'CHẾ ĐỘ CHỦ PHÒNG' : 'CHƠI OFFLINE'}
         </p>
       </header>
 
@@ -399,7 +445,7 @@ const App: React.FC = () => {
         </section>
 
         {/* Status Message */}
-        <div className="bg-tet-cream/90 text-tet-darkRed border-2 border-tet-gold rounded-xl px-6 py-3 text-center font-bold shadow-md w-full max-w-md min-h-[3.5rem] flex items-center justify-center transition-all">
+        <div className="bg-tet-cream/95 text-tet-darkRed border-2 border-tet-gold rounded-xl px-6 py-3 text-center font-bold shadow-md w-full max-w-md min-h-[3.5rem] flex items-center justify-center transition-all">
           {message}
         </div>
 
@@ -409,7 +455,7 @@ const App: React.FC = () => {
              bets={bets} 
              globalBets={globalBets} 
              onPlaceBet={handlePlaceBet} 
-             disabled={isShaking} 
+             disabled={isShaking || role === 'OFFLINE' && !roomId && false /* Allow offline play if no room */} 
             />
         </section>
 
@@ -417,13 +463,13 @@ const App: React.FC = () => {
         <section className="w-full max-w-2xl bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-tet-gold/30 shadow-2xl sticky bottom-4 z-50">
            <div className="flex flex-col md:flex-row items-center justify-between gap-4">
               
-              <div className="flex flex-col items-center md:items-start">
-                 <span className="text-tet-gold text-sm uppercase font-bold tracking-wider">Tài khoản</span>
+              <div className="flex flex-col items-center md:items-start min-w-[120px]">
+                 <span className="text-tet-gold text-xs uppercase font-bold tracking-wider mb-1">Ví Của Bạn</span>
                  <div className="text-3xl font-display text-white drop-shadow-md">
                     {formatMoney(balance)}
                  </div>
                  {currentTotalBet > 0 && (
-                   <span className="text-red-200 text-xs">Đang cược: {formatMoney(currentTotalBet)}</span>
+                   <span className="text-red-200 text-xs font-bold">Đang cược: {formatMoney(currentTotalBet)}</span>
                  )}
               </div>
 
@@ -433,15 +479,15 @@ const App: React.FC = () => {
                    disabled={isShaking || currentTotalBet === 0}
                    className="flex-1 md:flex-none px-4 py-3 rounded-xl bg-gray-600 hover:bg-gray-500 text-white font-bold transition disabled:opacity-50 disabled:cursor-not-allowed shadow-lg border-b-4 border-gray-800 active:border-b-0 active:translate-y-1"
                  >
-                   Hủy
+                   Hủy Cược
                  </button>
                  
                  {role === 'CLIENT' ? (
                    <button 
                      disabled={true}
-                     className="flex-[2] md:flex-none px-8 py-3 rounded-xl bg-gray-400 text-gray-800 font-display text-xl uppercase tracking-wider cursor-not-allowed opacity-80 border-b-4 border-gray-600"
+                     className="flex-[2] md:flex-none px-6 py-3 rounded-xl bg-gray-400 text-gray-800 font-display text-lg md:text-xl uppercase tracking-wider cursor-not-allowed opacity-80 border-b-4 border-gray-600 shadow-lg"
                    >
-                     {isShaking ? 'Đang Lắc...' : 'Chờ Chủ Phòng'}
+                     {isShaking ? 'Đang Lắc...' : 'Chờ Nhà Cái'}
                    </button>
                  ) : (
                    <button 
@@ -449,7 +495,7 @@ const App: React.FC = () => {
                      disabled={isShaking}
                      className="flex-[2] md:flex-none px-8 py-3 rounded-xl bg-gradient-to-r from-yellow-400 to-yellow-600 hover:from-yellow-300 hover:to-yellow-500 text-red-900 font-display text-xl uppercase tracking-wider transition disabled:opacity-50 disabled:cursor-not-allowed shadow-lg border-b-4 border-yellow-700 active:border-b-0 active:translate-y-1 animate-pulse"
                    >
-                     {isShaking ? 'Đang Lắc...' : 'Lắc Ngay!'}
+                     {isShaking ? 'Đang Lắc...' : 'Xốc Đĩa!'}
                    </button>
                  )}
               </div>
@@ -459,7 +505,7 @@ const App: React.FC = () => {
       </main>
 
       <footer className="w-full text-center py-4 text-red-300 text-xs">
-         © 2025 Game Bầu Cua Online - Kết nối PeerJS
+         © 2025 Game Bầu Cua Online - PeerJS P2P
       </footer>
     </div>
   );
