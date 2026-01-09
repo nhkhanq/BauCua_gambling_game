@@ -34,4 +34,10 @@ export type NetworkMessage =
   | { type: 'RESET_BETS' } // Client requests Host to clear their bets
   | { type: 'UPDATE_GLOBAL_BETS'; bets: Record<GameItemKey, number> } // Host broadcasts total bets
   | { type: 'PLAYER_UPDATE'; info: PlayerInfo } // Client sends their info (balance/name) to Host
-  | { type: 'LEADERBOARD_UPDATE'; players: PlayerInfo[] }; // Host broadcasts list of all players
+  | { type: 'LEADERBOARD_UPDATE'; players: PlayerInfo[] } // Host broadcasts list of all players
+  | { type: 'PLAYER_JOINED'; playerName: string } // Host broadcasts when player joins
+  | { type: 'PLAYER_LEFT'; playerName: string } // Host broadcasts when player leaves
+  | { type: 'KICKED_NO_MONEY' } // Host sends to specific client to kick them
+  | { type: 'JOIN_REQUEST'; playerInfo: PlayerInfo } // Client sends initial join request
+  | { type: 'JOIN_ACCEPTED'; roomState: { globalBets: Record<GameItemKey, number>; players: PlayerInfo[] } } // Host confirms join
+  | { type: 'JOIN_REJECTED'; reason: string }; // Host rejects join (e.g., insufficient balance)

@@ -12,6 +12,8 @@ export const GAME_ITEMS: GameItem[] = [
 export const BET_INCREMENT = 5000;
 export const INITIAL_BALANCE = 100000;
 export const SHAKE_DURATION = 1500; // ms
+export const MIN_BALANCE_TO_JOIN = 10000; // Tối thiểu 10k để vào phòng
+export const MIN_BALANCE_TO_STAY = 5000; // Nếu dưới 5k sẽ bị kick
 
 // Helper to look up item details
 export const getItemByKey = (key: GameItemKey): GameItem => {

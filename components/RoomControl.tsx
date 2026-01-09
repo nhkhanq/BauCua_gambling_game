@@ -5,11 +5,22 @@ interface RoomControlProps {
   currentRoomId: string | null;
   onCreateRoom: () => void;
   onCopyLink: () => void;
+  playerBalance?: number;
+  minBalanceRequired?: number;
 }
 
-const RoomControl: React.FC<RoomControlProps> = ({ currentRoomId, onCreateRoom, onCopyLink }) => {
+const RoomControl: React.FC<RoomControlProps> = ({ 
+  currentRoomId, 
+  onCreateRoom, 
+  onCopyLink,
+  playerBalance = 0,
+  minBalanceRequired = 10000
+}) => {
   const [showModal, setShowModal] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
+  
+  const formatMoney = (amount: number) => 
+    new Intl.NumberFormat('vi-VN').format(amount) + 'đ';
   
   // Auto open modal when room ID is set after clicking create
   useEffect(() => {
@@ -36,16 +47,30 @@ const RoomControl: React.FC<RoomControlProps> = ({ currentRoomId, onCreateRoom, 
     onCreateRoom();
   };
 
+  const canJoinRoom = playerBalance >= minBalanceRequired;
+
   return (
     <>
-      <div className="absolute top-4 right-4 z-50">
+      <div className="absolute top-4 right-4 z-50 flex flex-col items-end gap-2">
         {!currentRoomId ? (
-          <button 
-            onClick={handleCreateClick}
-            className="bg-tet-cream text-tet-darkRed text-xs md:text-sm font-bold px-3 py-2 rounded-full shadow-lg border-2 border-tet-gold hover:bg-white transition-transform hover:scale-105 flex items-center gap-2"
-          >
-            <span>👥</span> Tạo Phòng
-          </button>
+          <>
+            <button 
+              onClick={handleCreateClick}
+              disabled={!canJoinRoom}
+              className={`text-xs md:text-sm font-bold px-3 py-2 rounded-full shadow-lg border-2 transition-transform flex items-center gap-2 ${
+                canJoinRoom 
+                  ? 'bg-tet-cream text-tet-darkRed border-tet-gold hover:bg-white hover:scale-105 cursor-pointer'
+                  : 'bg-gray-300 text-gray-500 border-gray-400 cursor-not-allowed opacity-60'
+              }`}
+            >
+              <span>👥</span> Tạo Phòng
+            </button>
+            {!canJoinRoom && (
+              <div className="bg-red-600 text-white text-[10px] px-2 py-1 rounded shadow-md">
+                Cần {formatMoney(minBalanceRequired)}
+              </div>
+            )}
+          </>
         ) : (
           <button 
             onClick={() => setShowModal(true)}
@@ -93,9 +118,12 @@ const RoomControl: React.FC<RoomControlProps> = ({ currentRoomId, onCreateRoom, 
               </button>
             </div>
             
-            <p className="text-xs text-gray-400 mt-4 italic">
-              *Lưu ý: Mọi người phải có kết nối Internet để kết nối vào phòng.
-            </p>
+            <div className="text-xs text-gray-500 mt-4 space-y-1">
+              <p className="font-semibold text-gray-700">📋 Yêu cầu tham gia:</p>
+              <p>• Tối thiểu <span className="font-bold text-red-600">{formatMoney(minBalanceRequired)}</span> để vào phòng</p>
+              <p>• Sẽ bị loại nếu số dư {'<'} <span className="font-bold text-red-600">{formatMoney(minBalanceRequired / 2)}</span></p>
+              <p className="italic mt-2">*Cần kết nối Internet ổn định</p>
+            </div>
           </div>
         </div>
       )}

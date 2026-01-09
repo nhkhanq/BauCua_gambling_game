@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { GameItemKey, NetworkMessage, PlayerRole, PlayerInfo } from './types';
-import { GAME_ITEMS, BET_INCREMENT, INITIAL_BALANCE, SHAKE_DURATION } from './constants';
+import { GAME_ITEMS, BET_INCREMENT, INITIAL_BALANCE, SHAKE_DURATION, MIN_BALANCE_TO_JOIN, MIN_BALANCE_TO_STAY } from './constants';
 import DiceContainer from './components/DiceContainer';
 import BettingBoard from './components/BettingBoard';
 import RoomControl from './components/RoomControl';
@@ -77,6 +77,19 @@ const App: React.FC = () => {
   // --- Sync my info to Host whenever balance changes ---
   useEffect(() => {
     if (role === 'CLIENT' && myId) {
+      // Check if CLIENT ran out of money
+      if (balance < MIN_BALANCE_TO_STAY) {
+        setMessage("Bạn đã hết tiền! Đang rời phòng...");
+        setTimeout(() => {
+          if (peerRef.current) peerRef.current.destroy();
+          setRole('OFFLINE');
+          setRoomId(null);
+          window.history.pushState({}, '', window.location.pathname);
+          setMessage("Bạn đã bị loại khỏi phòng vì hết tiền.");
+        }, 2000);
+        return;
+      }
+
       const msg: NetworkMessage = {
         type: 'PLAYER_UPDATE',
         info: { id: myId, name: myName, balance, isHost: false }
@@ -89,6 +102,9 @@ const App: React.FC = () => {
       // Host updates their own info in the map directly
       playersInfoRef.current.set(myId, { id: myId, name: myName, balance, isHost: true });
       updateAndBroadcastLeaderboard();
+      
+      // Host checks all clients' balances and kicks those who are broke
+      checkAndKickBrokePlayers();
     }
   }, [balance, role, myId, myName]);
 
@@ -122,6 +138,41 @@ const App: React.FC = () => {
     broadcast({ type: 'LEADERBOARD_UPDATE', players: playersList });
   }, [broadcast]);
 
+  const checkAndKickBrokePlayers = useCallback(() => {
+    if (role !== 'HOST') return;
+    
+    const playersToKick: string[] = [];
+    playersInfoRef.current.forEach((player, playerId) => {
+      // Don't kick the host
+      if (!player.isHost && player.balance < MIN_BALANCE_TO_STAY) {
+        playersToKick.push(playerId);
+      }
+    });
+
+    playersToKick.forEach(playerId => {
+      const player = playersInfoRef.current.get(playerId);
+      const conn = connectionsRef.current.find(c => c.peer === playerId);
+      if (conn && player) {
+        // Send kick message
+        conn.send({ type: 'KICKED_NO_MONEY' } as NetworkMessage);
+        // Broadcast player left
+        broadcast({ type: 'PLAYER_LEFT', playerName: player.name });
+        // Close connection
+        setTimeout(() => conn.close(), 500);
+        // Clean up
+        playersInfoRef.current.delete(playerId);
+        allPlayersBetsRef.current.delete(playerId);
+        connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
+        setMessage(`${player.name} đã hết tiền và rời phòng.`);
+      }
+    });
+
+    if (playersToKick.length > 0) {
+      updateAndBroadcastGlobalBets();
+      updateAndBroadcastLeaderboard();
+    }
+  }, [role, broadcast, updateAndBroadcastGlobalBets, updateAndBroadcastLeaderboard]);
+
   // --- Network Setup ---
 
   const initHostPeer = (attemptId: string) => {
@@ -150,22 +201,25 @@ const App: React.FC = () => {
     });
 
     peer.on('connection', (conn) => {
-      connectionsRef.current.push(conn);
-      allPlayersBetsRef.current.set(conn.peer, getEmptyBets());
-
-      conn.on('data', (data) => handleHostReceivedMessage(data as NetworkMessage, conn.peer));
+      console.log('Player attempting to connect:', conn.peer);
+      
+      conn.on('data', (data) => handleHostReceivedMessage(data as NetworkMessage, conn.peer, conn));
       
       conn.on('open', () => {
-         // Sync state to new client
-         conn.send({ type: 'UPDATE_GLOBAL_BETS', bets: calculateGlobalBetsFromRef() });
-         conn.send({ type: 'LEADERBOARD_UPDATE', players: Array.from(playersInfoRef.current.values()) });
-         // If a shake happened recently, we could sync that too, but let's keep it simple
+         // Wait for JOIN_REQUEST from client before adding them
+         // Initial sync will be sent after JOIN_REQUEST is accepted
       });
       
       conn.on('close', () => {
+        const player = playersInfoRef.current.get(conn.peer);
+        if (player) {
+          broadcast({ type: 'PLAYER_LEFT', playerName: player.name });
+          setMessage(`${player.name} đã rời phòng.`);
+        }
+        
         connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
         allPlayersBetsRef.current.delete(conn.peer);
-        playersInfoRef.current.delete(conn.peer); // Remove from leaderboard
+        playersInfoRef.current.delete(conn.peer);
         updateAndBroadcastGlobalBets();
         updateAndBroadcastLeaderboard();
       });
@@ -181,6 +235,13 @@ const App: React.FC = () => {
   };
 
   const joinRoomAsClient = (targetRoomId: string) => {
+    // Check balance before attempting to join
+    if (balance < MIN_BALANCE_TO_JOIN) {
+      setMessage(`Cần tối thiểu ${formatMoney(MIN_BALANCE_TO_JOIN)} để vào phòng!`);
+      window.history.pushState({}, '', window.location.pathname);
+      return;
+    }
+
     if (peerRef.current) peerRef.current.destroy();
     connectionsRef.current = [];
 
@@ -191,17 +252,17 @@ const App: React.FC = () => {
       setRoomId(targetRoomId);
       setMyId(id);
       peerRef.current = peer;
-      setMessage("Đang vào phòng...");
+      setMessage("Đang kết nối đến phòng...");
 
       const conn = peer.connect(APP_PREFIX + targetRoomId);
       connectionsRef.current = [conn];
 
       conn.on('open', () => {
-        setMessage("Đã kết nối! Đặt cược đi.");
-        // Immediately send my info
+        setMessage("Đang xin vào phòng...");
+        // Send JOIN_REQUEST
         conn.send({ 
-          type: 'PLAYER_UPDATE', 
-          info: { id, name: myName, balance, isHost: false } 
+          type: 'JOIN_REQUEST', 
+          playerInfo: { id, name: myName, balance, isHost: false } 
         } as NetworkMessage);
       });
 
@@ -210,16 +271,64 @@ const App: React.FC = () => {
       conn.on('close', () => {
         setMessage("Mất kết nối với chủ phòng.");
         setRole('OFFLINE');
+        setRoomId(null);
       });
 
-      conn.on('error', () => setMessage("Không tìm thấy phòng này."));
+      conn.on('error', () => {
+        setMessage("Không tìm thấy phòng này.");
+        setRole('OFFLINE');
+        setRoomId(null);
+      });
+    });
+
+    peer.on('error', (err) => {
+      console.error('Peer error:', err);
+      setMessage("Lỗi kết nối. Vui lòng thử lại.");
+      setRole('OFFLINE');
+      setRoomId(null);
     });
   };
 
   // --- Message Handlers ---
 
-  const handleHostReceivedMessage = (msg: NetworkMessage, peerId: string) => {
-    if (msg.type === 'PLACE_BET') {
+  const handleHostReceivedMessage = (msg: NetworkMessage, peerId: string, conn?: DataConnection) => {
+    if (msg.type === 'JOIN_REQUEST') {
+      // Check if player has enough balance to join
+      if (msg.playerInfo.balance < MIN_BALANCE_TO_JOIN) {
+        if (conn) {
+          conn.send({ 
+            type: 'JOIN_REJECTED', 
+            reason: `Cần tối thiểu ${formatMoney(MIN_BALANCE_TO_JOIN)} để vào phòng.` 
+          } as NetworkMessage);
+          setTimeout(() => conn.close(), 500);
+        }
+        return;
+      }
+
+      // Accept the player
+      connectionsRef.current.push(conn!);
+      allPlayersBetsRef.current.set(peerId, getEmptyBets());
+      playersInfoRef.current.set(peerId, msg.playerInfo);
+
+      // Send acceptance with current room state
+      if (conn) {
+        conn.send({
+          type: 'JOIN_ACCEPTED',
+          roomState: {
+            globalBets: calculateGlobalBetsFromRef(),
+            players: Array.from(playersInfoRef.current.values())
+          }
+        } as NetworkMessage);
+      }
+
+      // Broadcast to all other players that someone joined
+      broadcast({ type: 'PLAYER_JOINED', playerName: msg.playerInfo.name });
+      setMessage(`${msg.playerInfo.name} đã vào phòng!`);
+      
+      updateAndBroadcastGlobalBets();
+      updateAndBroadcastLeaderboard();
+    }
+    else if (msg.type === 'PLACE_BET') {
       const playerBets = allPlayersBetsRef.current.get(peerId) || getEmptyBets();
       playerBets[msg.key] += msg.amount;
       allPlayersBetsRef.current.set(peerId, playerBets);
@@ -231,13 +340,51 @@ const App: React.FC = () => {
     }
     else if (msg.type === 'PLAYER_UPDATE') {
       // Update player info registry
-      playersInfoRef.current.set(peerId, msg.info);
-      updateAndBroadcastLeaderboard();
+      const existingPlayer = playersInfoRef.current.get(peerId);
+      if (existingPlayer) {
+        playersInfoRef.current.set(peerId, msg.info);
+        updateAndBroadcastLeaderboard();
+        
+        // Check if this player should be kicked
+        if (msg.info.balance < MIN_BALANCE_TO_STAY) {
+          checkAndKickBrokePlayers();
+        }
+      }
     }
   };
 
   const handleClientReceivedMessage = (msg: NetworkMessage) => {
-    if (msg.type === 'SHAKE_START') {
+    if (msg.type === 'JOIN_ACCEPTED') {
+      setGlobalBets(msg.roomState.globalBets);
+      setLeaderboard(msg.roomState.players);
+      setMessage("Đã vào phòng thành công! Chúc may mắn!");
+    } 
+    else if (msg.type === 'JOIN_REJECTED') {
+      setMessage(msg.reason);
+      setTimeout(() => {
+        if (peerRef.current) peerRef.current.destroy();
+        setRole('OFFLINE');
+        setRoomId(null);
+        window.history.pushState({}, '', window.location.pathname);
+      }, 3000);
+    }
+    else if (msg.type === 'KICKED_NO_MONEY') {
+      setMessage("Bạn đã hết tiền! Đang rời phòng...");
+      setTimeout(() => {
+        if (peerRef.current) peerRef.current.destroy();
+        setRole('OFFLINE');
+        setRoomId(null);
+        window.history.pushState({}, '', window.location.pathname);
+        setMessage("Bạn đã bị loại khỏi phòng vì hết tiền.");
+      }, 2000);
+    }
+    else if (msg.type === 'PLAYER_JOINED') {
+      setMessage(`🎉 ${msg.playerName} đã vào phòng!`);
+    }
+    else if (msg.type === 'PLAYER_LEFT') {
+      setMessage(`👋 ${msg.playerName} đã rời phòng.`);
+    }
+    else if (msg.type === 'SHAKE_START') {
       setIsShaking(true);
       setResultState(null);
       setMessage("Chủ phòng đang lắc...");
@@ -393,6 +540,8 @@ const App: React.FC = () => {
         currentRoomId={roomId} 
         onCreateRoom={handleCreateRoomAction}
         onCopyLink={handleCopyLink}
+        playerBalance={balance}
+        minBalanceRequired={MIN_BALANCE_TO_JOIN}
       />
 
       <header className="w-full bg-tet-red border-b-4 border-tet-gold shadow-lg pt-6 pb-4 px-4 text-center relative overflow-hidden">
