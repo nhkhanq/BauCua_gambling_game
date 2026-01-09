@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import Peer, { DataConnection } from 'peerjs';
 import { GameItemKey, NetworkMessage, PlayerRole, PlayerInfo } from './types';
-import { GAME_ITEMS, BET_INCREMENT, INITIAL_BALANCE, SHAKE_DURATION, MIN_BALANCE_TO_JOIN, MIN_BALANCE_TO_STAY } from './constants';
+import { GAME_ITEMS, BET_INCREMENT, INITIAL_BALANCE, SHAKE_DURATION, MIN_BALANCE_TO_JOIN, MIN_BALANCE_TO_STAY, PEER_CONFIG } from './constants';
 import DiceContainer from './components/DiceContainer';
 import BettingBoard from './components/BettingBoard';
 import RoomControl from './components/RoomControl';
@@ -221,7 +221,9 @@ const App: React.FC = () => {
     
     const fullId = APP_PREFIX + attemptId;
     logDebug('initHostPeer called', { attemptId, fullId });
-    const peer = new Peer(fullId);
+    
+    // Use PEER_CONFIG for better NAT traversal
+    const peer = new Peer(fullId, PEER_CONFIG);
     
     peer.on('open', () => {
       logDebug('HOST Peer open', { fullId });
@@ -250,6 +252,7 @@ const App: React.FC = () => {
       conn.on('open', () => {
          // Wait for JOIN_REQUEST from client before adding them
          // Initial sync will be sent after JOIN_REQUEST is accepted
+         logDebug('HOST connection opened with peer', { peer: conn.peer });
       });
       
       conn.on('close', () => {
@@ -266,14 +269,37 @@ const App: React.FC = () => {
         updateAndBroadcastGlobalBets();
         updateAndBroadcastLeaderboard();
       });
+      
+      conn.on('error', (err) => {
+        logDebug('HOST connection error with peer', { peer: conn.peer, error: err });
+        // Connection errors are usually handled by close event
+      });
+    });
+
+    peer.on('disconnected', () => {
+      logDebug('HOST Peer disconnected, attempting to reconnect...');
+      setMessage("Mất kết nối tạm thời, đang thử kết nối lại...");
+      // Try to reconnect to PeerJS server
+      if (peerRef.current && !peerRef.current.destroyed) {
+        peerRef.current.reconnect();
+      }
     });
 
     peer.on('error', (err) => {
-      logDebug('HOST Peer error', err);
+      logDebug('HOST Peer error', { type: err.type, message: err.message });
+      
       if (err.type === 'unavailable-id') {
-        initHostPeer(Math.random().toString(36).substring(2, 8).toUpperCase());
+        // Room ID already taken, generate new one
+        const newId = Math.random().toString(36).substring(2, 8).toUpperCase();
+        logDebug('Room ID unavailable, trying new ID', { newId });
+        setMessage("Mã phòng đã tồn tại, đang tạo mã mới...");
+        initHostPeer(newId);
+      } else if (err.type === 'network') {
+        setMessage("Lỗi mạng. Kiểm tra kết nối internet và thử lại.");
+      } else if (err.type === 'server-error') {
+        setMessage("Lỗi server PeerJS. Vui lòng thử lại sau.");
       } else {
-        setMessage("Lỗi mạng. Vui lòng tải lại.");
+        setMessage(`Lỗi: ${err.message}. Vui lòng tải lại trang.`);
       }
     });
   };
@@ -291,7 +317,8 @@ const App: React.FC = () => {
     if (peerRef.current) peerRef.current.destroy();
     connectionsRef.current = [];
 
-    const peer = new Peer();
+    // Use PEER_CONFIG for better NAT traversal
+    const peer = new Peer(PEER_CONFIG);
 
     peer.on('open', (id) => {
       logDebug('CLIENT Peer open', { id, targetRoomId });
@@ -323,24 +350,37 @@ const App: React.FC = () => {
       
       conn.on('close', () => {
         logDebug('CLIENT connection closed', { targetRoomId });
-        setMessage("Mất kết nối với chủ phòng.");
+        setMessage("Mất kết nối với chủ phòng. Thử tải lại trang để kết nối lại.");
         setRole('OFFLINE');
         setRoomId(null);
+        window.history.pushState({}, '', window.location.pathname);
       });
 
-      conn.on('error', () => {
-        logDebug('CLIENT connection error', { targetRoomId });
-        setMessage("Không tìm thấy phòng này.");
+      conn.on('error', (err) => {
+        logDebug('CLIENT connection error', { targetRoomId, error: err });
+        setMessage("Lỗi kết nối. Đảm bảo chủ phòng đã tạo phòng và bạn đang dùng link đúng.");
         setRole('OFFLINE');
         setRoomId(null);
+        window.history.pushState({}, '', window.location.pathname);
       });
     });
 
     peer.on('error', (err) => {
       logDebug('CLIENT Peer error', err);
-      setMessage("Lỗi kết nối. Vui lòng thử lại.");
+      let errorMsg = "Lỗi kết nối. Vui lòng thử lại.";
+      
+      if (err.type === 'peer-unavailable') {
+        errorMsg = "Không tìm thấy phòng này. Kiểm tra lại mã phòng hoặc chủ phòng chưa tạo phòng.";
+      } else if (err.type === 'network') {
+        errorMsg = "Lỗi mạng. Kiểm tra kết nối internet của bạn.";
+      } else if (err.type === 'disconnected') {
+        errorMsg = "Mất kết nối. Thử tải lại trang.";
+      }
+      
+      setMessage(errorMsg);
       setRole('OFFLINE');
       setRoomId(null);
+      window.history.pushState({}, '', window.location.pathname);
     });
   }, [balance, logDebug, myName]);
 
